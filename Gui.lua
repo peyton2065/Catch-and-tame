@@ -13,14 +13,14 @@
 --            Fix: Enum.KeyCode.RightShift  (was: "RightShift")
 --     NOTE:  CreateKeybind CurrentKeybind is a different field -- it accepts
 --            a string. Only CreateWindow ToggleUIKeybind is strict.
---   v1.1.2  Definitive vararg fix — no closure wrapper at all
+--   v1.1.2  Definitive vararg fix -- no closure wrapper at all
 --     ! FIX: Replaced pcall(function() f(table.unpack(args)) end) with
---            pcall(f, remote, ...) — the canonical Lua pattern. '...' stays
+--            pcall(f, remote, ...) -- the canonical Lua pattern. '...' stays
 --            in SafeFire/SafeInvoke's own vararg scope, never crosses a
 --            function boundary. Zero ambiguity in any Luau version.
 --     ! NOTE: If you see this error still, your GitHub Gui.lua is outdated.
 --             Re-upload this file to peyton2065/Catch-and-tame/main/Gui.lua.
---   v1.1.1  Luau vararg compile fix (intermediate — superseded by 1.1.2)
+--   v1.1.1  Luau vararg compile fix (intermediate -- superseded by 1.1.2)
 --     ! FIX: loadstring compile error ":264: Cannot use '...' outside
 --            of a vararg function"
 --            Root cause: Luau (Lua 5.1) does not allow '...' to be
@@ -36,13 +36,13 @@
 --     ! FIX: "attempt to call a nil value" on Rayfield load
 --            Root cause: __namecall hook installed before Rayfield,
 --            ST.OldNamecall could be nil if hookmetamethod fails.
---            Fix 1 — nil guard added inside hook body.
---            Fix 2 — hook now installs AFTER Rayfield is loaded.
---            Fix 3 — Rayfield fetched via http_request/request
+--            Fix 1 -- nil guard added inside hook body.
+--            Fix 2 -- hook now installs AFTER Rayfield is loaded.
+--            Fix 3 -- Rayfield fetched via http_request/request
 --                    (bypasses __namecall entirely, same as bootstrap).
 --     + Bootstrap-compatible: fetched by XenoScanner v4.2 loader.
 --   v1.0.0  Initial release
---     + Auto Farm  : TP → ThrowLasso → minigame bypass → place pet
+--     + Auto Farm  : TP -> ThrowLasso -> minigame bypass -> place pet
 --     + Auto Cash  : collectAllPetCash loop + offline cash drain
 --     + Economy    : auto buy food, auto feed, login/index rewards
 --     + Eggs       : instant hatch, auto breed loop
@@ -53,10 +53,10 @@
 --     + Config     : Rayfield save + Xeno.SetGlobal cross-session
 -- ============================================================
 
--- §0 ── SECURE MODE (before any Rayfield load)
+-- S0 -- SECURE MODE (before any Rayfield load)
 if getgenv then getgenv().SecureMode = true end
 
--- §1 ── EXECUTOR DETECTION
+-- S1 -- EXECUTOR DETECTION
 local IS_XENO = false
 do
     local name = ""
@@ -68,14 +68,14 @@ local EXECUTOR_NAME = (identifyexecutor and identifyexecutor())
                    or (getexecutorname and getexecutorname())
                    or "Unknown"
 
--- §2 ── UNC SHIMS  (ensure APIs exist before use)
+-- S2 -- UNC SHIMS  (ensure APIs exist before use)
 if not cloneref       then cloneref       = function(o) return o end end
 if not getnilinstances then getnilinstances = function() return {} end end
 if not getinstances   then getinstances   = function() return {} end end
 if not newcclosure    then newcclosure    = function(f) return f end end
 if not checkcaller    then checkcaller    = function() return false end end
 
--- §3 ── CLEANUP PREVIOUS INSTANCE
+-- S3 -- CLEANUP PREVIOUS INSTANCE
 do
     -- Kill any previous main-loop signal
     if getgenv then
@@ -108,7 +108,7 @@ do
     end
 end
 
--- §4 ── SERVICES  (cloneref throughout for anti-detection)
+-- S4 -- SERVICES  (cloneref throughout for anti-detection)
 local Players          = cloneref(game:GetService("Players"))
 local ReplicatedStorage = cloneref(game:GetService("ReplicatedStorage"))
 local RunService       = cloneref(game:GetService("RunService"))
@@ -118,7 +118,7 @@ local VirtualUser      = cloneref(game:GetService("VirtualUser"))
 local CoreGui          = cloneref(game:GetService("CoreGui"))
 local Workspace        = cloneref(game:GetService("Workspace"))
 
--- §5 ── PLAYER REFERENCES
+-- S5 -- PLAYER REFERENCES
 local Player  = Players.LocalPlayer
 local Camera  = Workspace.CurrentCamera
 
@@ -135,7 +135,7 @@ local function GetHumanoid()
     return c and c:FindFirstChildOfClass("Humanoid")
 end
 
--- §6 ── CONFIGURATION TABLE  (all user-facing settings + defaults)
+-- S6 -- CONFIGURATION TABLE  (all user-facing settings + defaults)
 local CFG = {
     -- Auto Farm
     AutoFarm        = false,
@@ -173,12 +173,12 @@ local CFG = {
     AutoSpin        = false,
 }
 
--- §7 ── STATE TABLE  (runtime-only — never persisted)
+-- S7 -- STATE TABLE  (runtime-only -- never persisted)
 local ST = {
     Running       = true,
     Connections   = {},             -- RBXScriptConnection pool
-    ESPObjects    = {},             -- {model → {gui, distLabel}}
-    PetRegistry   = {},             -- {model → true} event-driven
+    ESPObjects    = {},             -- {model -> {gui, distLabel}}
+    PetRegistry   = {},             -- {model -> true} event-driven
     NearestPet    = nil,
     CatchCount    = 0,
     MinigameSig   = nil,            -- cached minigame success args
@@ -190,7 +190,7 @@ local ST = {
 -- Write the global running flag so cleanup code can stop old instances
 if getgenv then getgenv().CAT_RUNNING = true end
 
--- §8 ── REMOTE CACHE
+-- S8 -- REMOTE CACHE
 local REM = {}  -- populated by CacheRemotes()
 
 local function FindRemotesFolder()
@@ -281,10 +281,10 @@ end
 
 CacheRemotes()
 
--- §9 ── UTILITY FUNCTIONS
+-- S9 -- UTILITY FUNCTIONS
 
 -- Safely fire a RemoteEvent.
--- Passes remote.FireServer and args directly into pcall — no closure wrapper.
+-- Passes remote.FireServer and args directly into pcall -- no closure wrapper.
 -- pcall(f, ...) forwards the extra args to f, so '...' stays in SafeFire's
 -- own vararg scope and never crosses a function boundary. This is the
 -- canonical Lua pattern and avoids the Luau vararg-in-closure restriction.
@@ -332,7 +332,7 @@ local function FindNearestPet()
                 end
             end
         else
-            -- Stale entry — prune it
+            -- Stale entry -- prune it
             ST.PetRegistry[model] = nil
         end
     end
@@ -340,7 +340,7 @@ local function FindNearestPet()
     return nearest, nearDist
 end
 
--- Post a Rayfield notification (safe to call before GUI is loaded — queued)
+-- Post a Rayfield notification (safe to call before GUI is loaded -- queued)
 local NotifyQueue = {}
 local RayfieldReady = false
 
@@ -358,7 +358,7 @@ local function Notify(title, content, duration, icon)
     end
 end
 
--- §10 ── PET REGISTRY  (event-driven — no per-frame GetDescendants)
+-- S10 -- PET REGISTRY  (event-driven -- no per-frame GetDescendants)
 local function RegisterPet(model)
     if not model or not model:IsA("Model") then return end
     local anchor = model:FindFirstChild("Root")
@@ -367,7 +367,7 @@ local function RegisterPet(model)
         ST.PetRegistry[model] = true
         -- If ESP is currently active, create the overlay immediately
         if CFG.ESPEnabled then
-            -- CreateESP defined in §13 — called only after it's defined
+            -- CreateESP defined in S13 -- called only after it's defined
             task.defer(function()
                 if _G.CreateESP_Fn then _G.CreateESP_Fn(model) end
             end)
@@ -406,16 +406,16 @@ if PetsFolder then
     table.insert(ST.Connections, removeConn)
 end
 
--- §11 ── MINIGAME HOOK
+-- S11 -- MINIGAME HOOK
 -- Intercepts legitimate minigameRequest calls during normal play and caches
 -- the exact success-state argument signature the server expects.
 -- On auto-farm, we replay that signature rather than guessing.
 
 -- NOTE: InstallMinigameHook() is defined here but intentionally NOT called yet.
--- It will be called in §14-POST, after Rayfield has fully loaded.
+-- It will be called in S14-POST, after Rayfield has fully loaded.
 -- Reason: if hookmetamethod returns nil (broken hook from a prior session),
 -- calling ST.OldNamecall() inside the hook body crashes with
--- "attempt to call a nil value" — which is exactly the error we're fixing.
+-- "attempt to call a nil value" -- which is exactly the error we're fixing.
 -- Deferring the install means our hook never intercepts the Rayfield HttpGet.
 local function InstallMinigameHook()
     if ST.HookActive then return end
@@ -431,7 +431,7 @@ local function InstallMinigameHook()
             ST.MinigameSig = {...}
         end
 
-        -- FIX: nil guard — if hookmetamethod returned nil, skip the passthrough
+        -- FIX: nil guard -- if hookmetamethod returned nil, skip the passthrough
         -- rather than crashing. Luau's normal dispatch still handles the call.
         if ST.OldNamecall then
             return ST.OldNamecall(self, ...)
@@ -445,13 +445,13 @@ local function InstallMinigameHook()
     end
 end
 
--- Hook NOT installed here — called after Rayfield loads (see §14-POST)
+-- Hook NOT installed here -- called after Rayfield loads (see S14-POST)
 
--- §12 ── CORE FEATURE FUNCTIONS
+-- S12 -- CORE FEATURE FUNCTIONS
 
 -- 12-A  Bypass the taming minigame
 local function SolveTamingMinigame()
-    -- Replay captured signature (most reliable — set after first natural catch)
+    -- Replay captured signature (most reliable -- set after first natural catch)
     if ST.MinigameSig then
         return SafeInvoke(REM.minigameRequest, table.unpack(ST.MinigameSig))
     end
@@ -499,7 +499,7 @@ local function ThrowLassoAt(target)
 end
 
 -- 12-C  Full single-pet catch cycle
---   TP → ThrowLasso → minigame → RequestPlacePet
+--   TP -> ThrowLasso -> minigame -> RequestPlacePet
 local function RunCatchCycle()
     local target, dist = FindNearestPet()
     if not target or not target.Parent then return end
@@ -571,7 +571,7 @@ local function FeedAllPets()
             task.wait(0.08)
         end
     else
-        -- No inventory data — fire blind, server handles target resolution
+        -- No inventory data -- fire blind, server handles target resolution
         SafeInvoke(REM.FeedPet)
     end
 end
@@ -619,9 +619,9 @@ local function RedeemCode(code)
     code = code:gsub("^%s+", ""):gsub("%s+$", "")   -- trim whitespace
     local result = SafeInvoke(REM.redeemCode, code)
     if result then
-        Notify("Code Redeemed ✓", code, 5, "check-circle")
+        Notify("Code Redeemed OK", code, 5, "check-circle")
     else
-        Notify("Code Failed ✗", code .. " — invalid or already used.", 4, "x-circle")
+        Notify("Code Failed X", code .. " -- invalid or already used.", 4, "x-circle")
     end
 end
 
@@ -665,7 +665,7 @@ local function SetAntiAFK(enabled)
     end
 end
 
--- §13 ── ESP SYSTEM
+-- S13 -- ESP SYSTEM
 
 -- Create a BillboardGui overlay for a roaming pet model
 local function CreateESP(model)
@@ -708,7 +708,7 @@ local function CreateESP(model)
     ST.ESPObjects[model] = { gui = bb, name = nameLabel, dist = distLabel }
 end
 
--- Expose CreateESP globally so RegisterPet can call it before §13 is "reached"
+-- Expose CreateESP globally so RegisterPet can call it before S13 is "reached"
 _G.CreateESP_Fn = CreateESP
 
 -- Destroy all active ESP overlays
@@ -719,7 +719,7 @@ local function DestroyAllESP()
     end
 end
 
--- Called every 0.5 s from main loop — updates distance labels + highlight
+-- Called every 0.5 s from main loop -- updates distance labels + highlight
 local function UpdateESP()
     local root = GetRoot()
     for model, obj in pairs(ST.ESPObjects) do
@@ -739,16 +739,16 @@ local function UpdateESP()
                 end)
             end
         else
-            -- Stale overlay — clean it
+            -- Stale overlay -- clean it
             pcall(function() if obj and obj.gui then obj.gui:Destroy() end end)
             ST.ESPObjects[model] = nil
         end
     end
 end
 
--- §14 ── RAYFIELD GUI
+-- S14 -- RAYFIELD GUI
 -- FIX: Rayfield is fetched via executor HTTP globals (http_request / request),
--- NOT via game:HttpGet. game:HttpGet is a __namecall method on game — if our
+-- NOT via game:HttpGet. game:HttpGet is a __namecall method on game -- if our
 -- hook (or a prior broken hook) is on __namecall, game:HttpGet crashes before
 -- Rayfield's body even executes, producing "attempt to call a nil value" at
 -- line 1 of the fetched chunk. http_request and request are C-level executor
@@ -773,9 +773,9 @@ if not rayfieldSrc and typeof(request) == "function" then
     end
 end
 
--- Attempt 3: game:HttpGet fallback — only safe when __namecall is clean
+-- Attempt 3: game:HttpGet fallback -- only safe when __namecall is clean
 -- (i.e. no hook installed yet, which is guaranteed because we deferred
--- InstallMinigameHook() to §14-POST below)
+-- InstallMinigameHook() to S14-POST below)
 if not rayfieldSrc then
     local ok, src = pcall(function() return game:HttpGet(RAYFIELD_URL) end)
     if ok and type(src) == "string" and #src > 10 then
@@ -800,7 +800,7 @@ end
 _G.RayfieldRef = Rayfield
 RayfieldReady  = true
 
--- §14-POST ── NOW safe to install the namecall hook.
+-- S14-POST -- NOW safe to install the namecall hook.
 -- Rayfield is already in memory; no more HttpGet calls go through __namecall.
 InstallMinigameHook()
 
@@ -826,9 +826,9 @@ local Window = Rayfield:CreateWindow({
     },
 })
 
--- ────────────────────────────────────────────────────────────
--- TAB 1 ─ AUTO FARM
--- ────────────────────────────────────────────────────────────
+-- ------------------------------------------------------------
+-- TAB 1 - AUTO FARM
+-- ------------------------------------------------------------
 local FarmTab = Window:CreateTab("Auto Farm", "crosshair")
 
 FarmTab:CreateSection("Catching")
@@ -898,9 +898,9 @@ FarmTab:CreateSection("Live Status")
 local CatchCountLabel = FarmTab:CreateLabel("Caught this session: 0", "activity")
 ST.StatusLabels.CatchCount = CatchCountLabel
 
--- ────────────────────────────────────────────────────────────
--- TAB 2 ─ ECONOMY
--- ────────────────────────────────────────────────────────────
+-- ------------------------------------------------------------
+-- TAB 2 - ECONOMY
+-- ------------------------------------------------------------
 local EconTab = Window:CreateTab("Economy", "coins")
 
 EconTab:CreateSection("Cash")
@@ -1027,9 +1027,9 @@ EconTab:CreateButton({
     Callback = UseSpin,
 })
 
--- ────────────────────────────────────────────────────────────
--- TAB 3 ─ EGGS & BREEDING
--- ────────────────────────────────────────────────────────────
+-- ------------------------------------------------------------
+-- TAB 3 - EGGS & BREEDING
+-- ------------------------------------------------------------
 local EggTab = Window:CreateTab("Eggs & Breeding", "star")
 
 EggTab:CreateSection("Hatching")
@@ -1090,9 +1090,9 @@ EggTab:CreateButton({
     end,
 })
 
--- ────────────────────────────────────────────────────────────
--- TAB 4 ─ PET ESP
--- ────────────────────────────────────────────────────────────
+-- ------------------------------------------------------------
+-- TAB 4 - PET ESP
+-- ------------------------------------------------------------
 local ESPTab = Window:CreateTab("Pet ESP", "eye")
 
 ESPTab:CreateSection("Overlay Settings")
@@ -1105,10 +1105,9 @@ ESPTab:CreateToggle({
         CFG.ESPEnabled = v
         if v then
             for model in pairs(ST.PetRegistry) do CreateESP(model) end
-            Notify("ESP", "Pet ESP active — " .. (function()
-                local n = 0; for _ in pairs(ST.PetRegistry) do n = n + 1 end
-                return n
-            end()) .. " overlays created.", 4, "eye")
+            local espCount = 0
+            for _ in pairs(ST.PetRegistry) do espCount = espCount + 1 end
+            Notify("ESP", "Pet ESP active. " .. espCount .. " overlays created.", 4, "eye")
         else
             DestroyAllESP()
             Notify("ESP", "Pet ESP disabled.", 3, "eye-off")
@@ -1156,13 +1155,13 @@ ESPTab:CreateButton({
         if CFG.ESPEnabled then
             for model in pairs(ST.PetRegistry) do CreateESP(model) end
         end
-        Notify("Registry", "Refreshed — " .. count .. " pets found.", 4, "refresh-cw")
+        Notify("Registry", "Refreshed -- " .. count .. " pets found.", 4, "refresh-cw")
     end,
 })
 
--- ────────────────────────────────────────────────────────────
--- TAB 5 ─ UTILITY
--- ────────────────────────────────────────────────────────────
+-- ------------------------------------------------------------
+-- TAB 5 - UTILITY
+-- ------------------------------------------------------------
 local UtilTab = Window:CreateTab("Utility", "wrench")
 
 UtilTab:CreateSection("Movement")
@@ -1210,7 +1209,7 @@ UtilTab:CreateToggle({
     Callback     = function(v)
         CFG.AntiAFK = v
         SetAntiAFK(v)
-        Notify("Anti-AFK", v and "Enabled — idle kick blocked." or "Disabled.", 3,
+        Notify("Anti-AFK", v and "Enabled -- idle kick blocked." or "Disabled.", 3,
                v and "shield" or "shield-off")
     end,
 })
@@ -1262,9 +1261,9 @@ UtilTab:CreateButton({
     end,
 })
 
--- ────────────────────────────────────────────────────────────
--- TAB 6 ─ SETTINGS
--- ────────────────────────────────────────────────────────────
+-- ------------------------------------------------------------
+-- TAB 6 - SETTINGS
+-- ------------------------------------------------------------
 local SettingsTab = Window:CreateTab("Settings", "settings")
 
 SettingsTab:CreateSection("Appearance")
@@ -1310,8 +1309,8 @@ do
     })
 end
 
--- §15 ── MAIN CONSOLIDATED LOOP
--- Single task.spawn with timer-based dispatch — minimal thread count.
+-- S15 -- MAIN CONSOLIDATED LOOP
+-- Single task.spawn with timer-based dispatch -- minimal thread count.
 task.spawn(function()
     local timers = {
         collect  = 0,
@@ -1389,7 +1388,7 @@ task.spawn(function()
     end
 end)
 
--- §16 ── AUTO FARM LOOP  (separate thread — has awaits inside cycle)
+-- S16 -- AUTO FARM LOOP  (separate thread -- has awaits inside cycle)
 task.spawn(function()
     while ST.Running and (not getgenv or getgenv().CAT_RUNNING ~= false) do
         if CFG.AutoFarm then
@@ -1401,17 +1400,17 @@ task.spawn(function()
     end
 end)
 
--- §17 ── CHARACTER RESPAWN HANDLER
+-- S17 -- CHARACTER RESPAWN HANDLER
 Player.CharacterAdded:Connect(function()
     task.wait(1.5)      -- let character finish loading
     ApplyMovement()
     if CFG.InfiniteJump then SetInfiniteJump(true) end
     task.wait(0.5)
     SafeFire(REM.ClientReady)
-    Notify("Character", "Respawned — systems restored.", 3, "user")
+    Notify("Character", "Respawned -- systems restored.", 3, "user")
 end)
 
--- §18 ── INITIALIZATION
+-- S18 -- INITIALIZATION
 do
     -- Register with server
     task.wait(0.5)
@@ -1440,7 +1439,7 @@ do
     for _ in pairs(ST.PetRegistry) do petCount = petCount + 1 end
 
     Notify(
-        "Catch & Tame  v1.0  ✓",
+        "Catch & Tame  v1.0  OK",
         remCount .. " remotes  |  " .. petCount .. " pets found\nRightShift to toggle GUI",
         7,
         "paw-print"
