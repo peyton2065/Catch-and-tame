@@ -1956,6 +1956,28 @@ FarmTab:CreateButton({
 })
 
 FarmTab:CreateButton({
+    Name     = "Complete Current Minigame",
+    Callback = function()
+        -- Fires UpdateProgress:FireServer(100) directly.
+        -- Use this while the taming minigame is on screen to instantly
+        -- complete it without waiting for the auto-farm loop.
+        if REM.UpdateProgress then
+            pcall(function() REM.UpdateProgress:FireServer(100) end)
+            Notify("Minigame", "Progress set to 100 -- minigame complete!", 4, "check-circle")
+        else
+            -- UpdateProgress not cached yet; trigger a remote refresh first
+            CacheRemotes()
+            if REM.UpdateProgress then
+                pcall(function() REM.UpdateProgress:FireServer(100) end)
+                Notify("Minigame", "Remote found and fired!", 4, "check-circle")
+            else
+                Notify("Minigame", "UpdateProgress not found. Try re-caching.", 4, "alert-circle")
+            end
+        end
+    end,
+})
+
+FarmTab:CreateButton({
     Name     = "Cancel Stuck Minigame",
     Callback = function()
         -- CancelMinigame resets a stuck minigame server-side (scanner-confirmed)
