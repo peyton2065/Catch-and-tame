@@ -95,8 +95,12 @@ local SKELETON_DURATION = 1200  -- lasts 20 minutes
 
 -- Per-remote fire cooldowns in seconds (mirrors known server limits)
 local REMOTE_COOLDOWNS = {
-    UpdateProgress     = 0.1,   -- minigame complete: FireServer(100)
-    minigameRequest    = 0.5,   -- legacy fallback
+    UpdateProgress     = 0.08,  -- minigame complete: FireServer(100) [RemoteEvent]
+    minigameRequest    = 0.5,   -- legacy fallback [RemoteFunction]
+    extendFence        = 1.0,
+    getEggInventory    = 0.5,
+    GetActiveWeather   = 2.0,
+    CancelMinigame     = 0.5,
     ThrowLasso         = 0.4,
     collectAllPetCash  = 2.0,
     FeedPet            = 0.15,
@@ -358,7 +362,12 @@ local WANTED_REMOTES = {
     "collectAllPetCash", "collectPetCash", "BuyFood",
     "FeedPet", "getOfflineCash",
     "InstantHatch", "breedRequest", "placeEgg",
-    "RequestEggHatch", "RequestEggNurseryPlacement",
+    "RequestEggHatch", "GetReadyToHatchEggs", "GetAllPenEggTimes",
+    "getEggInventory",
+    "extendFence", "getFenceStats",
+    "ClaimFeepEgg", "CancelMinigame",
+    "GetActiveWeather", "GetWeatherList",
+    "RequestEggNurseryPlacement",
     "RequestEggNurseryRetrieval",
     "BuyLasso", "EquipLasso", "equipLassoVisual",
     "AttemptUpgradeFarm", "AttemptSwapPet",
@@ -377,8 +386,7 @@ local WANTED_REMOTES = {
     -- weather / events
     "RequestWeather", "GetWeatherState", "RequestTotem",
     "CollectFruit", "PickupFruit",
-    -- sell
-    "SellPets", "SellEggs", "BulkSell",
+    -- sell (scanner confirmed: only sellPet + sellEgg exist)
     -- breed
     "BreedPets", "GetBreedRecipes",
 }
@@ -770,8 +778,9 @@ local function DetectWeather()
         return
     end
 
-    -- Try invoking a weather remote
-    local weatherResult = SafeInvoke(REM.GetWeatherState)
+    -- GetActiveWeather is the confirmed remote (scanner-verified)
+    local weatherResult = SafeInvoke(REM.GetActiveWeather)
+                       or SafeInvoke(REM.GetWeatherState)
     if type(weatherResult) == "string" then
         ST.Weather.Current = weatherResult
         return
@@ -780,6 +789,7 @@ local function DetectWeather()
         ST.Weather.Current = weatherResult.weather
                           or weatherResult.name
                           or weatherResult.current
+                          or (type(weatherResult[1]) == "string" and weatherResult[1])
                           or "Unknown"
         return
     end
@@ -980,7 +990,7 @@ local function TameSinglePet(entry)
         if REM.UpdateProgress then
             REM.UpdateProgress:FireServer(100)
         elseif REM.minigameRequest then
-            REM.minigameRequest:FireServer(true)
+            REM.minigameRequest:InvokeServer(true)
         end
     end)
 
@@ -1067,10 +1077,8 @@ local function SellPets()
             local tier = GetTierFromString(tostring(rarStr))
 
             if tier < threshold and tier > 0 then
-                local result = SafeInvoke(REM.sellPet, petData)
-                if result == nil then
-                    SafeFire(REM.SellPets, petData)
-                end
+                -- sellPet is a RemoteFunction (scanner confirmed). SellPets does not exist.
+                SafeInvoke(REM.sellPet, petData)
                 sold = sold + 1
                 task.wait(Jitter(0.25))
             end
@@ -1083,10 +1091,24 @@ local function SellPets()
 end
 
 local function SellEggs()
-    -- Placeholder: game egg data structure varies; fires blind sell
-    SafeFire(REM.sellEgg)
-    SafeFire(REM.SellEggs)
-    Notify("Sell", "Egg sell request sent.", 3, "package")
+    -- sellEgg is a RemoteFunction; getEggInventory gets the list first
+    local inventory = SafeInvoke(REM.getEggInventory)
+    if type(inventory) ~= "table" then
+        SafeInvoke(REM.sellEgg)
+        Notify("Sell", "Egg sell sent (blind).", 3, "package")
+        return
+    end
+    local sold = 0
+    for _, eggData in pairs(inventory) do
+        if type(eggData) == "table" then
+            SafeInvoke(REM.sellEgg, eggData)
+            sold = sold + 1
+            task.wait(Jitter(0.15))
+        end
+    end
+    if sold > 0 then
+        Notify("Sell", "Sold " .. sold .. " eggs.", 4, "package")
+    end
 end
 
 -- ============================================================
@@ -1453,10 +1475,23 @@ local function FeedAllPets()
     if type(inventory) ~= "table" then return end
     local fed = 0
     for _, petData in pairs(inventory) do
-        -- Skip non-table entries (metadata fields)
         if type(petData) == "table"
         and (petData.id or petData.Id or petData.petId or petData.name) then
-            SafeInvoke(REM.FeedPet, petData)
+            local feedOk = SafeInvoke(REM.FeedPet, petData)
+            -- Fallback: FeedPrompt ProximityPrompts on pen models
+            -- (structure scan confirmed FeedPrompt [ProximityPrompt] on pen pets)
+            if feedOk == nil or feedOk == false then
+                local penFolder = Workspace:FindFirstChild("Pens")
+                             or Workspace:FindFirstChild("PlayerPens")
+                if penFolder then
+                    for _, d in ipairs(penFolder:GetDescendants()) do
+                        if d:IsA("ProximityPrompt")
+                        and d.Name:lower():find("feed") then
+                            pcall(fireproximityprompt, d)
+                        end
+                    end
+                end
+            end
             fed = fed + 1
             task.wait(Jitter(0.09))
         end
@@ -1474,7 +1509,8 @@ end
 local function ClaimIndex()
     SafeFire(REM.ClaimIndex)
     SafeFire(REM.ClaimExclusive)
-    Notify("Rewards", "Index and exclusive rewards claimed!", 3, "star")
+    SafeFire(REM.ClaimFeepEgg)  -- confirmed RemoteEvent (scanner-verified)
+    Notify("Rewards", "Index, exclusive, and Feep egg claimed!", 3, "star")
 end
 
 local function UseSpin()
@@ -1494,10 +1530,21 @@ local function RedeemCode(code)
 end
 
 local function InstantHatchAll()
+    -- GetReadyToHatchEggs returns which eggs are done (scanner-verified RemoteFunction)
+    local readyEggs = SafeInvoke(REM.GetReadyToHatchEggs)
+    if type(readyEggs) == "table" and #readyEggs > 0 then
+        for _, egg in ipairs(readyEggs) do
+            SafeInvoke(REM.RequestEggHatch, egg)
+            task.wait(Jitter(0.1))
+        end
+        Notify("Eggs", "Hatched " .. #readyEggs .. " ready eggs.", 4, "egg")
+        return
+    end
+    -- Fallback: blind InstantHatch for all eggs
     SafeFire(REM.InstantHatch)
     SafeFire(REM.InstantHatch, true)
     SafeInvoke(REM.RequestEggHatch)
-    Notify("Eggs", "Instant hatch triggered!", 3, "zap")
+    Notify("Eggs", "Instant hatch sent.", 3, "zap")
 end
 
 -- ============================================================
@@ -1906,6 +1953,15 @@ FarmTab:CreateSection("Manual Controls")
 FarmTab:CreateButton({
     Name     = "Catch Best Pet Now",
     Callback = function() task.spawn(RunCatchCycle) end,
+})
+
+FarmTab:CreateButton({
+    Name     = "Cancel Stuck Minigame",
+    Callback = function()
+        -- CancelMinigame resets a stuck minigame server-side (scanner-confirmed)
+        SafeFire(REM.CancelMinigame)
+        Notify("Minigame", "Cancel sent.", 3, "x-circle")
+    end,
 })
 
 FarmTab:CreateButton({
@@ -2445,10 +2501,20 @@ UtilTab:CreateInput({
 })
 
 UtilTab:CreateButton({
-    Name     = "Upgrade Farm",
+    Name     = "Upgrade Farm / Extend Fence",
     Callback = function()
+        -- extendFence is the confirmed fence-upgrade remote (RemoteFunction)
+        SafeInvoke(REM.extendFence)
         SafeFire(REM.AttemptUpgradeFarm)
-        Notify("Farm", "Upgrade sent!", 3, "arrow-up-circle")
+        Notify("Farm", "Fence extend + farm upgrade sent.", 3, "arrow-up-circle")
+    end,
+})
+
+UtilTab:CreateButton({
+    Name     = "Claim Free Feep Egg",
+    Callback = function()
+        SafeFire(REM.ClaimFeepEgg)
+        Notify("Eggs", "Feep egg claim sent!", 3, "gift")
     end,
 })
 
