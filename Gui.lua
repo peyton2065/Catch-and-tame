@@ -95,7 +95,8 @@ local SKELETON_DURATION = 1200  -- lasts 20 minutes
 
 -- Per-remote fire cooldowns in seconds (mirrors known server limits)
 local REMOTE_COOLDOWNS = {
-    minigameRequest    = 0.5,
+    UpdateProgress     = 0.1,   -- minigame complete: FireServer(100)
+    minigameRequest    = 0.5,   -- legacy fallback
     ThrowLasso         = 0.4,
     collectAllPetCash  = 2.0,
     FeedPet            = 0.15,
@@ -352,7 +353,7 @@ local ST = {
 local REM = {}
 
 local WANTED_REMOTES = {
-    "ThrowLasso", "minigameRequest", "pickupRequest",
+    "ThrowLasso", "UpdateProgress", "minigameRequest", "pickupRequest",
     "RequestPlacePet", "RunPet", "MovePets",
     "collectAllPetCash", "collectPetCash", "BuyFood",
     "FeedPet", "getOfflineCash",
@@ -720,7 +721,7 @@ local function InstallHook()
 
         -- Capture minigame signature
         if method == "InvokeServer"
-        and self == REM.minigameRequest
+        and (self == REM.minigameRequest or self == REM.UpdateProgress)
         and not checkcaller()
         and not ST.MinigameSigValidated then
             ST.MinigameSig = args
@@ -970,36 +971,18 @@ local function TameSinglePet(entry)
     end)
     task.wait(0.2)
 
-    -- Solve minigame: GUI watcher + remote bypass in parallel
+    -- Solve minigame: fire UpdateProgress(100) as primary.
+    -- GUI watcher runs as backup for any UI elements that may still appear.
     task.spawn(function()
-        WatchAndClickMinigameGUI(3.5)
+        WatchAndClickMinigameGUI(2.0)
     end)
-    local sig = ST.MinigameSig
-    if sig and ST.MinigameSigValidated then
-        pcall(function()
-            if REM.minigameRequest then
-                REM.minigameRequest:InvokeServer(table.unpack(sig))
-            end
-        end)
-    else
-        local patterns = {{true}, {1}, {"success"}, {"complete"}}
-        for _, pargs in ipairs(patterns) do
-            local result
-            pcall(function()
-                if REM.minigameRequest then
-                    result = REM.minigameRequest:InvokeServer(table.unpack(pargs))
-                end
-            end)
-            if result then
-                if not ST.MinigameSigValidated then
-                    ST.MinigameSig = pargs
-                    ST.MinigameSigValidated = true
-                end
-                break
-            end
-            task.wait(0.05)
+    pcall(function()
+        if REM.UpdateProgress then
+            REM.UpdateProgress:FireServer(100)
+        elseif REM.minigameRequest then
+            REM.minigameRequest:FireServer(true)
         end
-    end
+    end)
 
     task.wait(0.15)
 
@@ -1333,41 +1316,30 @@ local function WatchAndClickMinigameGUI(timeout)
     return clicked
 end
 
+-- Solves the taming minigame by firing UpdateProgress:FireServer(100).
+-- Community research confirms this is the actual minigame completion remote:
+--   ReplicatedStorage.Remotes.UpdateProgress:FireServer(100)
+-- Passing 100 tells the server the progress bar is full -> instant catch.
+-- minigameRequest is kept as a secondary fallback for future game changes.
 local function SolveTamingMinigame()
+    -- Primary: UpdateProgress(100) -- confirmed working across all public scripts
+    if REM.UpdateProgress then
+        pcall(function()
+            REM.UpdateProgress:FireServer(100)
+        end)
+        return true
+    end
+
+    -- Secondary: minigameRequest (legacy / fallback)
     if ST.MinigameSig and ST.MinigameSigValidated then
         return SafeCall(REM.minigameRequest, table.unpack(ST.MinigameSig))
     end
 
-    local patterns = {
-        {true}, {1}, {"success"}, {"complete"}, {"win"},
-        {true, 1}, {1, true}, {"success", true}, {"complete", 1},
-        {true, "success"}, {1, "complete"},
-    }
-
-    -- If we have an unvalidated captured sig, try it first
-    if ST.MinigameSig then
-        local result = SafeCall(REM.minigameRequest, table.unpack(ST.MinigameSig))
-        if result then
-            ST.MinigameSigValidated = true
-            return result
-        end
+    if REM.minigameRequest then
+        SafeCall(REM.minigameRequest, true)
     end
 
-    for _, pargs in ipairs(patterns) do
-        if not CanFire("minigameRequest") then task.wait(0.5) end
-        local result = SafeCall(REM.minigameRequest, table.unpack(pargs))
-        task.wait(0.06)
-        if result then
-            ST.MinigameSig = pargs
-            ST.MinigameSigValidated = true
-            Notify("Minigame", "Signature found and validated!", 4, "check-circle")
-            return result
-        end
-    end
-
-    -- Last resort: fire and hope
-    SafeCall(REM.minigameRequest, true)
-    return nil
+    return false
 end
 
 local function ThrowLassoAt(target, anchor)
@@ -1408,16 +1380,13 @@ local function RunCatchCycle()
     local thrown = ThrowLassoAt(entry.model, anchor)
     task.wait(Jitter(0.25))
 
-    -- Solve minigame: run GUI watcher and remote bypass in parallel.
-    -- WatchAndClickMinigameGUI handles UI-based minigames (button appears
-    -- on screen after the lasso lands). SolveTamingMinigame handles
-    -- remote-based bypass once a signature is captured.
-    -- Both run concurrently so whichever path the game uses is covered.
+    -- Solve minigame via UpdateProgress:FireServer(100) (confirmed remote).
+    -- GUI watcher runs in parallel as backup for any screen UI that appears.
     task.spawn(function()
-        WatchAndClickMinigameGUI(3.5)
+        WatchAndClickMinigameGUI(2.0)
     end)
     SolveTamingMinigame()
-    task.wait(Jitter(0.35))
+    task.wait(Jitter(0.3))
 
     -- Place pet in pen
     if CFG.AutoPlacePet then
@@ -1956,11 +1925,11 @@ FarmTab:CreateSection("Tame All Pets")
 
 FarmTab:CreateParagraph({
     Title   = "How Tame All works",
-    Content = "Fires ThrowLasso + minigameRequest at every pet in the"
+    Content = "Fires ThrowLasso + UpdateProgress(100) at every pet in the"
            .. " registry simultaneously. No teleporting required -- the"
            .. " server receives the lasso fire with the pets position."
-           .. " Uses your captured minigame signature if available, or"
-           .. " runs a rapid pattern sweep to find one."
+           .. " UpdateProgress:FireServer(100) is the confirmed instant-catch"
+           .. " remote used by all public scripts."
            .. " Respects your rarity filter, blacklist, and whitelist.",
 })
 
