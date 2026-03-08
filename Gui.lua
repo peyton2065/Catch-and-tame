@@ -1,12 +1,24 @@
 -- ============================================================
 --   CATCH & TAME  |  ADVANCED OPERATION SCRIPT
---   Version  : 1.1.0
+--   Version  : 1.1.1
 --   Executor : Xeno (UNC compatible)
 --   PlaceId  : 96645548064314
 --   Author   : ENI
 --   Load via : XenoScanner v4.2 Bootstrap (Gui.lua on GitHub)
 -- ============================================================
 -- CHANGELOG
+--   v1.1.1  Luau vararg compile fix
+--     ! FIX: loadstring compile error ":264: Cannot use '...' outside
+--            of a vararg function"
+--            Root cause: Luau (Lua 5.1) does not allow '...' to be
+--            captured by a closure that didn't declare it. The anonymous
+--            function() passed to pcall in SafeFire/SafeInvoke had no
+--            vararg context of its own.
+--            Fix: pack '...' into local args = {...} before the closure
+--            boundary; table.unpack(args) re-expands inside the closure
+--            where args is a normal upvalue, not a vararg.
+--     ! FIX: REM.FeedPet:InvokeServer called directly (nil-unsafe).
+--            Routed through SafeInvoke for consistent nil guard.
 --   v1.1.0  Bootstrap compatibility + hook crash fix
 --     ! FIX: "attempt to call a nil value" on Rayfield load
 --            Root cause: __namecall hook installed before Rayfield,
@@ -259,16 +271,22 @@ CacheRemotes()
 -- §9 ── UTILITY FUNCTIONS
 
 -- Safely fire a RemoteEvent
+-- FIX: '...' cannot be captured by a closure in Luau (Lua 5.1 dialect).
+-- Pack into a local table first; table is a normal upvalue and crosses the
+-- function boundary freely. table.unpack re-expands it inside the closure.
 local function SafeFire(remote, ...)
     if not remote then return false end
-    local ok, err = pcall(function() remote:FireServer(...) end)
+    local args = {...}
+    local ok, _ = pcall(function() remote:FireServer(table.unpack(args)) end)
     return ok
 end
 
 -- Safely invoke a RemoteFunction, returns result or nil
+-- Same fix applied — varargs packed before the pcall closure.
 local function SafeInvoke(remote, ...)
     if not remote then return nil end
-    local ok, result = pcall(function() return remote:InvokeServer(...) end)
+    local args = {...}
+    local ok, result = pcall(function() return remote:InvokeServer(table.unpack(args)) end)
     return ok and result or nil
 end
 
@@ -538,7 +556,7 @@ local function FeedAllPets()
     local inventory = SafeInvoke(REM.getPetInventory)
     if type(inventory) == "table" then
         for _, petData in ipairs(inventory) do
-            pcall(function() REM.FeedPet:InvokeServer(petData) end)
+            SafeInvoke(REM.FeedPet, petData)
             task.wait(0.08)
         end
     else
