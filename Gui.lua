@@ -1,11 +1,21 @@
 -- ============================================================
 --   CATCH & TAME  |  ADVANCED OPERATION SCRIPT
---   Version  : 1.0.0
+--   Version  : 1.1.0
 --   Executor : Xeno (UNC compatible)
 --   PlaceId  : 96645548064314
 --   Author   : ENI
+--   Load via : XenoScanner v4.2 Bootstrap (Gui.lua on GitHub)
 -- ============================================================
 -- CHANGELOG
+--   v1.1.0  Bootstrap compatibility + hook crash fix
+--     ! FIX: "attempt to call a nil value" on Rayfield load
+--            Root cause: __namecall hook installed before Rayfield,
+--            ST.OldNamecall could be nil if hookmetamethod fails.
+--            Fix 1 — nil guard added inside hook body.
+--            Fix 2 — hook now installs AFTER Rayfield is loaded.
+--            Fix 3 — Rayfield fetched via http_request/request
+--                    (bypasses __namecall entirely, same as bootstrap).
+--     + Bootstrap-compatible: fetched by XenoScanner v4.2 loader.
 --   v1.0.0  Initial release
 --     + Auto Farm  : TP → ThrowLasso → minigame bypass → place pet
 --     + Auto Cash  : collectAllPetCash loop + offline cash drain
@@ -372,27 +382,41 @@ end
 -- the exact success-state argument signature the server expects.
 -- On auto-farm, we replay that signature rather than guessing.
 
+-- NOTE: InstallMinigameHook() is defined here but intentionally NOT called yet.
+-- It will be called in §14-POST, after Rayfield has fully loaded.
+-- Reason: if hookmetamethod returns nil (broken hook from a prior session),
+-- calling ST.OldNamecall() inside the hook body crashes with
+-- "attempt to call a nil value" — which is exactly the error we're fixing.
+-- Deferring the install means our hook never intercepts the Rayfield HttpGet.
 local function InstallMinigameHook()
     if ST.HookActive then return end
-    if not hookmetamethod then return end  -- executor doesn't support hooks
+    if not hookmetamethod then return end  -- executor doesn't support this API
 
-    ST.HookActive = true
-    ST.OldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-        local method = getnamecallmethod()
+    local candidate = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+        local method = getnamecallmethod and getnamecallmethod() or ""
 
         if method == "InvokeServer"
         and self == REM.minigameRequest
         and not checkcaller()
         and not ST.MinigameSig then
-            -- We observed the game calling this naturally — capture the args
             ST.MinigameSig = {...}
         end
 
-        return ST.OldNamecall(self, ...)
+        -- FIX: nil guard — if hookmetamethod returned nil, skip the passthrough
+        -- rather than crashing. Luau's normal dispatch still handles the call.
+        if ST.OldNamecall then
+            return ST.OldNamecall(self, ...)
+        end
     end))
+
+    -- Only mark active if hookmetamethod gave us a valid original back
+    if candidate ~= nil then
+        ST.OldNamecall = candidate
+        ST.HookActive  = true
+    end
 end
 
-InstallMinigameHook()
+-- Hook NOT installed here — called after Rayfield loads (see §14-POST)
 
 -- §12 ── CORE FEATURE FUNCTIONS
 
@@ -694,10 +718,62 @@ local function UpdateESP()
 end
 
 -- §14 ── RAYFIELD GUI
+-- FIX: Rayfield is fetched via executor HTTP globals (http_request / request),
+-- NOT via game:HttpGet. game:HttpGet is a __namecall method on game — if our
+-- hook (or a prior broken hook) is on __namecall, game:HttpGet crashes before
+-- Rayfield's body even executes, producing "attempt to call a nil value" at
+-- line 1 of the fetched chunk. http_request and request are C-level executor
+-- globals that bypass Roblox's metatable entirely.
 
-local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
-_G.RayfieldRef   = Rayfield
-RayfieldReady    = true
+local RAYFIELD_URL = "https://sirius.menu/rayfield"
+local rayfieldSrc  = nil
+
+-- Attempt 1: http_request (Xeno standard UNC name)
+if typeof(http_request) == "function" then
+    local ok, res = pcall(http_request, { Url = RAYFIELD_URL, Method = "GET" })
+    if ok and res and type(res.Body) == "string" and #res.Body > 10 then
+        rayfieldSrc = res.Body
+    end
+end
+
+-- Attempt 2: request (alternate UNC alias)
+if not rayfieldSrc and typeof(request) == "function" then
+    local ok, res = pcall(request, { Url = RAYFIELD_URL, Method = "GET" })
+    if ok and res and type(res.Body) == "string" and #res.Body > 10 then
+        rayfieldSrc = res.Body
+    end
+end
+
+-- Attempt 3: game:HttpGet fallback — only safe when __namecall is clean
+-- (i.e. no hook installed yet, which is guaranteed because we deferred
+-- InstallMinigameHook() to §14-POST below)
+if not rayfieldSrc then
+    local ok, src = pcall(function() return game:HttpGet(RAYFIELD_URL) end)
+    if ok and type(src) == "string" and #src > 10 then
+        rayfieldSrc = src
+    end
+end
+
+if not rayfieldSrc then
+    error("[CAT] Failed to fetch Rayfield from all sources. Check your internet connection.")
+end
+
+local rayfieldLoader, compileErr = loadstring(rayfieldSrc)
+if not rayfieldLoader then
+    error("[CAT] Rayfield compile error: " .. tostring(compileErr))
+end
+
+local Rayfield = rayfieldLoader()
+if not Rayfield then
+    error("[CAT] Rayfield returned nil on execution. Library may have changed.")
+end
+
+_G.RayfieldRef = Rayfield
+RayfieldReady  = true
+
+-- §14-POST ── NOW safe to install the namecall hook.
+-- Rayfield is already in memory; no more HttpGet calls go through __namecall.
+InstallMinigameHook()
 
 -- Flush any notifications that fired before Rayfield loaded
 for _, payload in ipairs(NotifyQueue) do
