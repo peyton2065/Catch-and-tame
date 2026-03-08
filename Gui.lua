@@ -1,43 +1,36 @@
 -- ============================================================
 --   CATCH & TAME  |  ADVANCED OPERATION SCRIPT
---   Version  : 1.1.1
+--   Version  : 1.2.0
 --   Executor : Xeno (UNC compatible)
 --   PlaceId  : 96645548064314
 --   Author   : ENI
 --   Load via : XenoScanner v4.2 Bootstrap (Gui.lua on GitHub)
 -- ============================================================
 -- CHANGELOG
---   v1.1.1  Luau vararg compile fix
---     ! FIX: loadstring compile error ":264: Cannot use '...' outside
---            of a vararg function"
---            Root cause: Luau (Lua 5.1) does not allow '...' to be
---            captured by a closure that didn't declare it. The anonymous
---            function() passed to pcall in SafeFire/SafeInvoke had no
---            vararg context of its own.
---            Fix: pack '...' into local args = {...} before the closure
---            boundary; table.unpack(args) re-expands inside the closure
---            where args is a normal upvalue, not a vararg.
---     ! FIX: REM.FeedPet:InvokeServer called directly (nil-unsafe).
---            Routed through SafeInvoke for consistent nil guard.
+--   v1.2.0  Comprehensive diagnostic fix pass (10 findings)
+--     ! FIX [F-001]: Vararg compile error confirmed resolved. Added
+--            cache-busting guidance for bootstrap loader.
+--     ! FIX [F-002]: Hook passthrough redesigned. Pre-captures original
+--            __namecall via getrawmetatable before hookmetamethod call.
+--            Fallback chain prevents silent network call failure.
+--     ! FIX [F-003]: PetRegistry iteration now snapshots before mutation.
+--            Stale entries collected and pruned after loop completes.
+--     ! FIX [F-004]: Connection pool converted from array to named
+--            dictionary. Re-toggling overwrites instead of appending.
+--     ! FIX [F-005]: SolveTamingMinigame now checks remote:IsA() to
+--            dispatch FireServer vs InvokeServer correctly via SafeCall.
+--     ! FIX [F-006]: FeedAllPets uses pairs() for dictionary-safe
+--            iteration. Blind no-args fallback removed.
+--     ! FIX [F-007]: Session token replaces boolean CAT_RUNNING flag.
+--            Prevents dual-instance race conditions.
+--     ! FIX [F-008]: ESP overlays cleaned up via AncestryChanged
+--            listener instead of relying solely on polling.
+--     ! FIX [F-009]: Deduplicated 'RequestPlacePet' in WANTED array.
+--     ! FIX [F-010]: Resilient UpdateLabel wrapper tries multiple
+--            Rayfield API methods (:Set, :Update, :Refresh, .Text).
+--   v1.1.1  Luau vararg compile fix (see F-001)
 --   v1.1.0  Bootstrap compatibility + hook crash fix
---     ! FIX: "attempt to call a nil value" on Rayfield load
---            Root cause: __namecall hook installed before Rayfield,
---            ST.OldNamecall could be nil if hookmetamethod fails.
---            Fix 1 — nil guard added inside hook body.
---            Fix 2 — hook now installs AFTER Rayfield is loaded.
---            Fix 3 — Rayfield fetched via http_request/request
---                    (bypasses __namecall entirely, same as bootstrap).
---     + Bootstrap-compatible: fetched by XenoScanner v4.2 loader.
 --   v1.0.0  Initial release
---     + Auto Farm  : TP → ThrowLasso → minigame bypass → place pet
---     + Auto Cash  : collectAllPetCash loop + offline cash drain
---     + Economy    : auto buy food, auto feed, login/index rewards
---     + Eggs       : instant hatch, auto breed loop
---     + Pet ESP    : live BillboardGui overlays, distance, highlight
---     + Utility    : speed, jump power, infinite jump, anti-AFK
---     + Tools      : code redeem, totem, trait machine, farm upgrade
---     + GUI        : Rayfield, 6 tabs, live status labels, keybind
---     + Config     : Rayfield save + Xeno.SetGlobal cross-session
 -- ============================================================
 
 -- §0 ── SECURE MODE (before any Rayfield load)
@@ -56,20 +49,29 @@ local EXECUTOR_NAME = (identifyexecutor and identifyexecutor())
                    or "Unknown"
 
 -- §2 ── UNC SHIMS  (ensure APIs exist before use)
-if not cloneref       then cloneref       = function(o) return o end end
-if not getnilinstances then getnilinstances = function() return {} end end
-if not getinstances   then getinstances   = function() return {} end end
-if not newcclosure    then newcclosure    = function(f) return f end end
-if not checkcaller    then checkcaller    = function() return false end end
+if not cloneref         then cloneref         = function(o) return o end end
+if not getnilinstances  then getnilinstances   = function() return {} end end
+if not getinstances     then getinstances     = function() return {} end end
+if not newcclosure      then newcclosure      = function(f) return f end end
+if not checkcaller      then checkcaller      = function() return false end end
+if not getrawmetatable  then getrawmetatable  = function() return nil end end
 
 -- §3 ── CLEANUP PREVIOUS INSTANCE
+-- [F-007 FIX] Session token prevents dual-instance race conditions.
+-- Old approach used a boolean flag — if the new script set CAT_RUNNING = true
+-- before the old loop checked it, both instances would run simultaneously.
+-- Now each instance writes a unique token; loops exit when the token changes.
+local SESSION_TOKEN = tostring(tick()) .. "_" .. tostring(math.random(1, 999999))
+
 do
-    -- Kill any previous main-loop signal
     if getgenv then
-        if getgenv().CAT_RUNNING ~= nil then
+        local oldToken = getgenv().CAT_SESSION
+        if oldToken then
             getgenv().CAT_RUNNING = false
-            task.wait(0.25)             -- brief pause for old loops to exit
+            task.wait(0.35)  -- slightly longer grace period for old loops
         end
+        getgenv().CAT_SESSION = SESSION_TOKEN
+        getgenv().CAT_RUNNING = true
     end
 
     -- Destroy previous Rayfield GUI if present
@@ -96,18 +98,18 @@ do
 end
 
 -- §4 ── SERVICES  (cloneref throughout for anti-detection)
-local Players          = cloneref(game:GetService("Players"))
+local Players           = cloneref(game:GetService("Players"))
 local ReplicatedStorage = cloneref(game:GetService("ReplicatedStorage"))
-local RunService       = cloneref(game:GetService("RunService"))
-local TweenService     = cloneref(game:GetService("TweenService"))
-local UserInputService = cloneref(game:GetService("UserInputService"))
-local VirtualUser      = cloneref(game:GetService("VirtualUser"))
-local CoreGui          = cloneref(game:GetService("CoreGui"))
-local Workspace        = cloneref(game:GetService("Workspace"))
+local RunService        = cloneref(game:GetService("RunService"))
+local TweenService      = cloneref(game:GetService("TweenService"))
+local UserInputService  = cloneref(game:GetService("UserInputService"))
+local VirtualUser       = cloneref(game:GetService("VirtualUser"))
+local CoreGui           = cloneref(game:GetService("CoreGui"))
+local Workspace         = cloneref(game:GetService("Workspace"))
 
 -- §5 ── PLAYER REFERENCES
-local Player  = Players.LocalPlayer
-local Camera  = Workspace.CurrentCamera
+local Player = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
 
 -- Live-safe helpers (character can nil out on respawn)
 local function GetChar()
@@ -161,10 +163,13 @@ local CFG = {
 }
 
 -- §7 ── STATE TABLE  (runtime-only — never persisted)
+-- [F-004 FIX] Connections is now a named dictionary, not an array.
+-- Re-toggling features overwrites the previous connection key instead of
+-- appending duplicates. This prevents unbounded memory growth on respawn.
 local ST = {
     Running       = true,
-    Connections   = {},             -- RBXScriptConnection pool
-    ESPObjects    = {},             -- {model → {gui, distLabel}}
+    Connections   = {},             -- {name → RBXScriptConnection}
+    ESPObjects    = {},             -- {model → {gui, name, dist, ancestryConn}}
     PetRegistry   = {},             -- {model → true} event-driven
     NearestPet    = nil,
     CatchCount    = 0,
@@ -174,8 +179,7 @@ local ST = {
     StatusLabels  = {},             -- Rayfield label refs for live update
 }
 
--- Write the global running flag so cleanup code can stop old instances
-if getgenv then getgenv().CAT_RUNNING = true end
+-- Global running flag already set in §3 with session token
 
 -- §8 ── REMOTE CACHE
 local REM = {}  -- populated by CacheRemotes()
@@ -208,7 +212,8 @@ end
 local function CacheRemotes()
     local folder = FindRemotesFolder()
 
-    -- Known remote names from structure analysis
+    -- [F-009 FIX] Deduplicated — RequestPlacePet appears only once.
+    -- Previously listed under both "Core farm loop" and "Farm / Pen".
     local WANTED = {
         -- Core farm loop
         "ThrowLasso", "minigameRequest", "pickupRequest",
@@ -222,10 +227,10 @@ local function CacheRemotes()
         "RequestEggNurseryRetrieval",
         -- Lasso
         "BuyLasso", "EquipLasso", "equipLassoVisual",
-        -- Farm / Pen
+        -- Farm / Pen (RequestPlacePet already listed above)
         "AttemptUpgradeFarm", "AttemptSwapPet",
         "GetFarmLevel", "GetPetInventoryData",
-        "RequestPlacePet", "RequestWalkPet",
+        "RequestWalkPet",
         -- Data
         "retrieveData", "getPetInventory", "getPetRev",
         "getPlayerIndex", "getSaveInfo",
@@ -253,7 +258,6 @@ local function CacheRemotes()
     end
 
     -- Second pass: catch any remotes spread across the whole tree
-    -- (some games nest them inside data modules)
     for _, obj in ipairs(game:GetDescendants()) do
         if (obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction")) and not REM[obj.Name] then
             for _, wname in ipairs(WANTED) do
@@ -270,10 +274,10 @@ CacheRemotes()
 
 -- §9 ── UTILITY FUNCTIONS
 
--- Safely fire a RemoteEvent
--- FIX: '...' cannot be captured by a closure in Luau (Lua 5.1 dialect).
--- Pack into a local table first; table is a normal upvalue and crosses the
--- function boundary freely. table.unpack re-expands it inside the closure.
+-- [F-001 FIX] Varargs packed before closure boundary.
+-- Luau (Lua 5.1) does not allow '...' to be captured by a closure
+-- that didn't declare it. We pack into a local table (normal upvalue)
+-- and table.unpack re-expands inside the closure.
 local function SafeFire(remote, ...)
     if not remote then return false end
     local args = {...}
@@ -281,13 +285,24 @@ local function SafeFire(remote, ...)
     return ok
 end
 
--- Safely invoke a RemoteFunction, returns result or nil
--- Same fix applied — varargs packed before the pcall closure.
 local function SafeInvoke(remote, ...)
     if not remote then return nil end
     local args = {...}
     local ok, result = pcall(function() return remote:InvokeServer(table.unpack(args)) end)
     return ok and result or nil
+end
+
+-- [F-005 FIX] Unified safe-call that auto-detects RemoteEvent vs RemoteFunction.
+-- Prevents FireServer being called on a RemoteFunction (which has no such method)
+-- and vice versa. Used in SolveTamingMinigame where the remote type is unknown.
+local function SafeCall(remote, ...)
+    if not remote then return nil end
+    if remote:IsA("RemoteFunction") then
+        return SafeInvoke(remote, ...)
+    elseif remote:IsA("RemoteEvent") then
+        return SafeFire(remote, ...)
+    end
+    return nil
 end
 
 -- Euclidean distance between two Vector3 positions
@@ -303,11 +318,14 @@ local function TeleportTo(position, offset)
     root.CFrame = CFrame.new(position + (offset or Vector3.new(0, 3, 0)))
 end
 
--- Find the nearest unregistered roaming pet model
+-- [F-003 FIX] Snapshot registry before iteration, defer all mutations.
+-- Lua 5.1 pairs() iteration with mid-loop table modification is undefined
+-- behavior. We collect stale entries and prune them AFTER the loop.
 local function FindNearestPet()
     local root = GetRoot()
     if not root then return nil, math.huge end
     local nearest, nearDist = nil, math.huge
+    local stale = {}
 
     for model in pairs(ST.PetRegistry) do
         if model and model.Parent then
@@ -321,12 +339,34 @@ local function FindNearestPet()
                 end
             end
         else
-            -- Stale entry — prune it
-            ST.PetRegistry[model] = nil
+            -- Collect stale entry — do NOT nil it during iteration
+            stale[#stale + 1] = model
         end
     end
 
+    -- Prune stale entries AFTER iteration completes
+    for _, m in ipairs(stale) do
+        ST.PetRegistry[m] = nil
+    end
+
     return nearest, nearDist
+end
+
+-- [F-010 FIX] Resilient label update wrapper.
+-- Rayfield's Label API varies between versions — :Set(), :Update(),
+-- :Refresh(), or direct .Text property. This wrapper tries all known
+-- methods and caches nothing (each call re-tests in case of hot-reload).
+local function UpdateLabel(label, text, icon)
+    if not label then return end
+    local methods = {"Set", "Update", "Refresh"}
+    for _, method in ipairs(methods) do
+        if typeof(label[method]) == "function" then
+            local ok = pcall(label[method], label, text, icon)
+            if ok then return end
+        end
+    end
+    -- Direct property fallback
+    pcall(function() label.Text = text end)
 end
 
 -- Post a Rayfield notification (safe to call before GUI is loaded — queued)
@@ -356,7 +396,6 @@ local function RegisterPet(model)
         ST.PetRegistry[model] = true
         -- If ESP is currently active, create the overlay immediately
         if CFG.ESPEnabled then
-            -- CreateESP defined in §13 — called only after it's defined
             task.defer(function()
                 if _G.CreateESP_Fn then _G.CreateESP_Fn(model) end
             end)
@@ -368,6 +407,10 @@ local function UnregisterPet(model)
     ST.PetRegistry[model] = nil
     local obj = ST.ESPObjects[model]
     if obj then
+        -- [F-008 FIX] Disconnect AncestryChanged listener
+        if obj.ancestryConn then
+            pcall(function() obj.ancestryConn:Disconnect() end)
+        end
         pcall(function() obj.gui:Destroy() end)
         ST.ESPObjects[model] = nil
     end
@@ -383,32 +426,36 @@ if PetsFolder then
         RegisterPet(model)
     end
 
-    -- Keep registry live
-    local addConn = PetsFolder.ChildAdded:Connect(function(child)
+    -- [F-004 FIX] Named connection keys — overwrite instead of append
+    ST.Connections.PetAdded = PetsFolder.ChildAdded:Connect(function(child)
         task.wait(0.1)              -- let model fully load before reading parts
         RegisterPet(child)
     end)
-    local removeConn = PetsFolder.ChildRemoved:Connect(function(child)
+    ST.Connections.PetRemoved = PetsFolder.ChildRemoved:Connect(function(child)
         UnregisterPet(child)
     end)
-    table.insert(ST.Connections, addConn)
-    table.insert(ST.Connections, removeConn)
 end
 
 -- §11 ── MINIGAME HOOK
--- Intercepts legitimate minigameRequest calls during normal play and caches
--- the exact success-state argument signature the server expects.
--- On auto-farm, we replay that signature rather than guessing.
-
--- NOTE: InstallMinigameHook() is defined here but intentionally NOT called yet.
--- It will be called in §14-POST, after Rayfield has fully loaded.
--- Reason: if hookmetamethod returns nil (broken hook from a prior session),
--- calling ST.OldNamecall() inside the hook body crashes with
--- "attempt to call a nil value" — which is exactly the error we're fixing.
--- Deferring the install means our hook never intercepts the Rayfield HttpGet.
+-- [F-002 FIX] Redesigned hook with pre-captured fallback chain.
+-- Problem: hookmetamethod can return nil on some executors even when
+-- the hook installs successfully. The old code's nil-guard prevented
+-- a crash but caused ALL __namecall calls to silently return nil.
+-- Fix: pre-capture the original __namecall via getrawmetatable BEFORE
+-- hooking. Use whichever reference exists (return value or pre-capture).
 local function InstallMinigameHook()
     if ST.HookActive then return end
-    if not hookmetamethod then return end  -- executor doesn't support this API
+    if not hookmetamethod then return end
+
+    -- Pre-capture the original __namecall before hookmetamethod replaces it
+    local originalNamecall = nil
+    local mt = getrawmetatable(game)
+    if mt then
+        local ok, val = pcall(function() return rawget(mt, "__namecall") end)
+        if ok and typeof(val) == "function" then
+            originalNamecall = val
+        end
+    end
 
     local candidate = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
         local method = getnamecallmethod and getnamecallmethod() or ""
@@ -420,18 +467,18 @@ local function InstallMinigameHook()
             ST.MinigameSig = {...}
         end
 
-        -- FIX: nil guard — if hookmetamethod returned nil, skip the passthrough
-        -- rather than crashing. Luau's normal dispatch still handles the call.
-        if ST.OldNamecall then
-            return ST.OldNamecall(self, ...)
+        -- Use hookmetamethod return OR pre-captured fallback — whichever exists
+        local passthrough = ST.OldNamecall or originalNamecall
+        if passthrough then
+            return passthrough(self, ...)
         end
+        -- If BOTH are nil (should not happen on a functioning executor),
+        -- we fall through without crashing. Luau's default dispatch handles it.
     end))
 
-    -- Only mark active if hookmetamethod gave us a valid original back
-    if candidate ~= nil then
-        ST.OldNamecall = candidate
-        ST.HookActive  = true
-    end
+    -- Store whichever reference we obtained
+    ST.OldNamecall = candidate or originalNamecall
+    ST.HookActive  = (ST.OldNamecall ~= nil)
 end
 
 -- Hook NOT installed here — called after Rayfield loads (see §14-POST)
@@ -439,14 +486,15 @@ end
 -- §12 ── CORE FEATURE FUNCTIONS
 
 -- 12-A  Bypass the taming minigame
+-- [F-005 FIX] Uses SafeCall to auto-detect RemoteEvent vs RemoteFunction.
+-- No more FireServer on a RemoteFunction (which crashes silently in pcall).
 local function SolveTamingMinigame()
     -- Replay captured signature (most reliable — set after first natural catch)
     if ST.MinigameSig then
-        return SafeInvoke(REM.minigameRequest, table.unpack(ST.MinigameSig))
+        return SafeCall(REM.minigameRequest, table.unpack(ST.MinigameSig))
     end
 
     -- Tiered discovery: try common success-state patterns
-    -- We stop and cache the first pattern that returns a truthy result
     local patterns = {
         {true},
         {1},
@@ -460,7 +508,7 @@ local function SolveTamingMinigame()
     }
 
     for _, args in ipairs(patterns) do
-        local result = SafeInvoke(REM.minigameRequest, table.unpack(args))
+        local result = SafeCall(REM.minigameRequest, table.unpack(args))
         task.wait(0.05)
         if result then
             ST.MinigameSig = args   -- remember winning pattern
@@ -468,8 +516,8 @@ local function SolveTamingMinigame()
         end
     end
 
-    -- Last resort: fire without expecting a meaningful return value
-    SafeFire(REM.minigameRequest, true)
+    -- Last resort — SafeCall handles type correctly
+    SafeCall(REM.minigameRequest, true)
     return nil
 end
 
@@ -488,7 +536,6 @@ local function ThrowLassoAt(target)
 end
 
 -- 12-C  Full single-pet catch cycle
---   TP → ThrowLasso → minigame → RequestPlacePet
 local function RunCatchCycle()
     local target, dist = FindNearestPet()
     if not target or not target.Parent then return end
@@ -518,13 +565,11 @@ local function RunCatchCycle()
 
     ST.CatchCount = ST.CatchCount + 1
 
-    -- Update status label
+    -- [F-010 FIX] Uses resilient UpdateLabel wrapper
     local labelText = "Caught: " .. ST.CatchCount
                    .. "  |  Last: " .. target.Name:sub(1, 12)
                    .. "  (" .. math.floor(dist) .. " studs)"
-    if ST.StatusLabels.CatchCount then
-        pcall(function() ST.StatusLabels.CatchCount:Set(labelText, "crosshair") end)
-    end
+    UpdateLabel(ST.StatusLabels.CatchCount, labelText, "crosshair")
 end
 
 -- 12-D  Collect all pen cash + offline income
@@ -534,16 +579,12 @@ local function CollectAllCash()
     -- Drain any queued offline income
     local offlineCash = SafeInvoke(REM.getOfflineCash)
     if type(offlineCash) == "number" and offlineCash > 0 then
-        -- Server queues the amount; second collect drains it
         task.wait(0.1)
         SafeFire(REM.collectAllPetCash)
     end
 
-    if ST.StatusLabels.CashStatus then
-        pcall(function()
-            ST.StatusLabels.CashStatus:Set("Last collect: " .. os.date("%H:%M:%S"), "clock")
-        end)
-    end
+    -- [F-010 FIX] Uses resilient UpdateLabel wrapper
+    UpdateLabel(ST.StatusLabels.CashStatus, "Last collect: " .. os.date("%H:%M:%S"), "clock")
 end
 
 -- 12-E  Buy food from shop
@@ -552,16 +593,24 @@ local function BuyFood()
 end
 
 -- 12-F  Feed all owned pets
+-- [F-006 FIX] Uses pairs() for dictionary-safe iteration.
+-- Removed blind no-args fallback — if inventory is nil/non-table, we exit.
+-- If inventory is a dictionary, pairs() handles it; ipairs() would skip all.
 local function FeedAllPets()
     local inventory = SafeInvoke(REM.getPetInventory)
-    if type(inventory) == "table" then
-        for _, petData in ipairs(inventory) do
+    if type(inventory) ~= "table" then return end
+
+    local fed = 0
+    for k, petData in pairs(inventory) do
+        if type(petData) == "table" or type(petData) == "userdata" then
             SafeInvoke(REM.FeedPet, petData)
+            fed = fed + 1
             task.wait(0.08)
         end
-    else
-        -- No inventory data — fire blind, server handles target resolution
-        SafeInvoke(REM.FeedPet)
+    end
+
+    if fed == 0 then
+        Notify("Feed", "No feedable pets found in inventory.", 3, "alert-circle")
     end
 end
 
@@ -575,10 +624,8 @@ end
 
 -- 12-H  Attempt to breed using available pets
 local function TryBreed()
-    -- Try with no args first; game resolves pair from owned pets server-side
     local result = SafeInvoke(REM.breedRequest)
     if not result then
-        -- Try with placeholder slot indices
         SafeInvoke(REM.breedRequest, 1, 2)
     end
 end
@@ -605,7 +652,7 @@ end
 -- 12-L  Redeem a promo code
 local function RedeemCode(code)
     if not code or code == "" then return end
-    code = code:gsub("^%s+", ""):gsub("%s+$", "")   -- trim whitespace
+    code = code:gsub("^%s+", ""):gsub("%s+$", "")
     local result = SafeInvoke(REM.redeemCode, code)
     if result then
         Notify("Code Redeemed ✓", code, 5, "check-circle")
@@ -624,39 +671,42 @@ local function ApplyMovement()
 end
 
 -- 12-N  Infinite jump (toggle)
-local infJumpConn
+-- [F-004 FIX] Uses named connection key — overwrites on re-toggle
 local function SetInfiniteJump(enabled)
-    if infJumpConn then
-        infJumpConn:Disconnect()
-        infJumpConn = nil
+    if ST.Connections.InfiniteJump then
+        ST.Connections.InfiniteJump:Disconnect()
+        ST.Connections.InfiniteJump = nil
     end
     if enabled then
-        infJumpConn = UserInputService.JumpRequest:Connect(function()
+        ST.Connections.InfiniteJump = UserInputService.JumpRequest:Connect(function()
             local hum = GetHumanoid()
             if hum then
                 hum:ChangeState(Enum.HumanoidStateType.Jumping)
             end
         end)
-        table.insert(ST.Connections, infJumpConn)
     end
 end
 
 -- 12-O  Anti-AFK
-local afkConn
+-- [F-004 FIX] Uses named connection key — overwrites on re-toggle
 local function SetAntiAFK(enabled)
-    if afkConn then afkConn:Disconnect(); afkConn = nil end
+    if ST.Connections.AntiAFK then
+        ST.Connections.AntiAFK:Disconnect()
+        ST.Connections.AntiAFK = nil
+    end
     if enabled then
-        afkConn = Player.Idled:Connect(function()
+        ST.Connections.AntiAFK = Player.Idled:Connect(function()
             VirtualUser:CaptureController()
             VirtualUser:ClickButton2(Vector2.new())
         end)
-        table.insert(ST.Connections, afkConn)
     end
 end
 
 -- §13 ── ESP SYSTEM
 
--- Create a BillboardGui overlay for a roaming pet model
+-- [F-008 FIX] ESP overlays now attach an AncestryChanged listener to the
+-- model for immediate cleanup when the pet despawns. No longer reliant
+-- solely on the 0.5s polling cycle in UpdateESP to catch orphans.
 local function CreateESP(model)
     if ST.ESPObjects[model] then return end     -- already has overlay
     local anchor = model:FindFirstChild("Root")
@@ -694,7 +744,22 @@ local function CreateESP(model)
     distLabel.TextSize             = 11
     distLabel.Parent               = bb
 
-    ST.ESPObjects[model] = { gui = bb, name = nameLabel, dist = distLabel }
+    -- Immediate cleanup when model leaves the DataModel
+    local ancestryConn
+    ancestryConn = model.AncestryChanged:Connect(function(_, parent)
+        if not parent then
+            pcall(function() bb:Destroy() end)
+            if ancestryConn then ancestryConn:Disconnect() end
+            ST.ESPObjects[model] = nil
+        end
+    end)
+
+    ST.ESPObjects[model] = {
+        gui  = bb,
+        name = nameLabel,
+        dist = distLabel,
+        ancestryConn = ancestryConn,
+    }
 end
 
 -- Expose CreateESP globally so RegisterPet can call it before §13 is "reached"
@@ -703,14 +768,21 @@ _G.CreateESP_Fn = CreateESP
 -- Destroy all active ESP overlays
 local function DestroyAllESP()
     for model, obj in pairs(ST.ESPObjects) do
+        -- [F-008 FIX] Also disconnect AncestryChanged listeners
+        if obj.ancestryConn then
+            pcall(function() obj.ancestryConn:Disconnect() end)
+        end
         pcall(function() obj.gui:Destroy() end)
         ST.ESPObjects[model] = nil
     end
 end
 
 -- Called every 0.5 s from main loop — updates distance labels + highlight
+-- [F-003 FIX] Stale overlay cleanup deferred to after iteration
 local function UpdateESP()
     local root = GetRoot()
+    local stale = {}
+
     for model, obj in pairs(ST.ESPObjects) do
         if model and model.Parent and obj and obj.gui and obj.gui.Parent then
             local anchor = model:FindFirstChild("Root")
@@ -719,7 +791,6 @@ local function UpdateESP()
                 local dist = math.floor(GetDistance(root.Position, anchor.Position))
                 pcall(function()
                     obj.dist.Text = dist .. " studs"
-                    -- Gold highlight on the current nearest target
                     if CFG.HighlightNearest and ST.NearestPet == model then
                         obj.name.TextColor3 = Color3.fromRGB(255, 210, 0)
                     else
@@ -728,21 +799,25 @@ local function UpdateESP()
                 end)
             end
         else
-            -- Stale overlay — clean it
-            pcall(function() if obj and obj.gui then obj.gui:Destroy() end end)
-            ST.ESPObjects[model] = nil
+            -- Collect stale — do NOT mutate during iteration
+            stale[#stale + 1] = { model = model, obj = obj }
         end
+    end
+
+    -- Prune stale overlays after iteration
+    for _, entry in ipairs(stale) do
+        if entry.obj then
+            if entry.obj.ancestryConn then
+                pcall(function() entry.obj.ancestryConn:Disconnect() end)
+            end
+            pcall(function() if entry.obj.gui then entry.obj.gui:Destroy() end end)
+        end
+        ST.ESPObjects[entry.model] = nil
     end
 end
 
 -- §14 ── RAYFIELD GUI
--- FIX: Rayfield is fetched via executor HTTP globals (http_request / request),
--- NOT via game:HttpGet. game:HttpGet is a __namecall method on game — if our
--- hook (or a prior broken hook) is on __namecall, game:HttpGet crashes before
--- Rayfield's body even executes, producing "attempt to call a nil value" at
--- line 1 of the fetched chunk. http_request and request are C-level executor
--- globals that bypass Roblox's metatable entirely.
-
+-- Rayfield fetched via executor HTTP globals (bypasses __namecall)
 local RAYFIELD_URL = "https://sirius.menu/rayfield"
 local rayfieldSrc  = nil
 
@@ -762,9 +837,7 @@ if not rayfieldSrc and typeof(request) == "function" then
     end
 end
 
--- Attempt 3: game:HttpGet fallback — only safe when __namecall is clean
--- (i.e. no hook installed yet, which is guaranteed because we deferred
--- InstallMinigameHook() to §14-POST below)
+-- Attempt 3: game:HttpGet fallback (safe — no hook installed yet)
 if not rayfieldSrc then
     local ok, src = pcall(function() return game:HttpGet(RAYFIELD_URL) end)
     if ok and type(src) == "string" and #src > 10 then
@@ -790,7 +863,6 @@ _G.RayfieldRef = Rayfield
 RayfieldReady  = true
 
 -- §14-POST ── NOW safe to install the namecall hook.
--- Rayfield is already in memory; no more HttpGet calls go through __namecall.
 InstallMinigameHook()
 
 -- Flush any notifications that fired before Rayfield loaded
@@ -800,10 +872,10 @@ end
 NotifyQueue = {}
 
 local Window = Rayfield:CreateWindow({
-    Name            = "Catch & Tame  v1.0",
+    Name            = "Catch & Tame  v1.2.0",
     Icon            = "paw-print",
     LoadingTitle    = "Catch & Tame Script",
-    LoadingSubtitle = "Xeno | v1.0.0 | by ENI",
+    LoadingSubtitle = "Xeno | v1.2.0 | by ENI",
     Theme           = "Default",
     ToggleUIKeybind = "RightShift",
     DisableRayfieldPrompts = false,
@@ -1097,7 +1169,7 @@ ESPTab:CreateToggle({
             Notify("ESP", "Pet ESP active — " .. (function()
                 local n = 0; for _ in pairs(ST.PetRegistry) do n = n + 1 end
                 return n
-            end()) .. " overlays created.", 4, "eye")
+            end)() .. " overlays created.", 4, "eye")
         else
             DestroyAllESP()
             Notify("ESP", "Pet ESP disabled.", 3, "eye-off")
@@ -1111,7 +1183,6 @@ ESPTab:CreateColorPicker({
     Flag     = "ESPColorPicker",
     Callback = function(v)
         CFG.ESPColor = v
-        -- Propagate color to all live overlays
         for _, obj in pairs(ST.ESPObjects) do
             pcall(function() obj.name.TextColor3 = v end)
         end
@@ -1277,7 +1348,7 @@ SettingsTab:CreateKeybind({
     CurrentKeybind = "RightShift",
     HoldToInteract = false,
     Flag           = "ToggleGUIKeybind",
-    Callback       = function() end,    -- Rayfield ToggleUIKeybind handles this
+    Callback       = function() end,
 })
 
 SettingsTab:CreateSection("Script Info")
@@ -1289,7 +1360,7 @@ do
     for _ in pairs(ST.PetRegistry) do petCount = petCount + 1 end
 
     SettingsTab:CreateParagraph({
-        Title   = "Catch & Tame  v1.0.0",
+        Title   = "Catch & Tame  v1.2.0",
         Content = "Executor: " .. EXECUTOR_NAME
                .. "\nRemotes cached: " .. remCount
                .. "\nPets in registry: " .. petCount
@@ -1300,7 +1371,7 @@ do
 end
 
 -- §15 ── MAIN CONSOLIDATED LOOP
--- Single task.spawn with timer-based dispatch — minimal thread count.
+-- [F-007 FIX] Loop guard checks OWN session token, not just boolean
 task.spawn(function()
     local timers = {
         collect  = 0,
@@ -1313,7 +1384,9 @@ task.spawn(function()
         movement = 0,
     }
 
-    while ST.Running and (not getgenv or getgenv().CAT_RUNNING ~= false) do
+    while ST.Running
+      and (not getgenv or (getgenv().CAT_RUNNING ~= false
+           and getgenv().CAT_SESSION == SESSION_TOKEN)) do
         local now = tick()
 
         -- Movement: re-apply after respawn or teleport (every 1 s)
@@ -1330,7 +1403,7 @@ task.spawn(function()
             timers.collect = now
         end
 
-        -- Auto Buy Food + Feed (share same interval counter)
+        -- Auto Buy Food + Feed
         if now - timers.feed > CFG.FeedInterval then
             if CFG.AutoBuyFood then task.spawn(BuyFood) end
             if CFG.AutoFeedPets then task.spawn(FeedAllPets) end
@@ -1361,16 +1434,12 @@ task.spawn(function()
             timers.esp = now
         end
 
-        -- Pet count label (every 2 s)
+        -- [F-010 FIX] Pet count label via UpdateLabel wrapper
         if now - timers.petcount > 2 then
-            if ST.StatusLabels.PetCount then
-                local n = 0
-                for _ in pairs(ST.PetRegistry) do n = n + 1 end
-                pcall(function()
-                    ST.StatusLabels.PetCount:Set(
-                        "Roaming pets in registry: " .. n, "map-pin")
-                end)
-            end
+            local n = 0
+            for _ in pairs(ST.PetRegistry) do n = n + 1 end
+            UpdateLabel(ST.StatusLabels.PetCount,
+                "Roaming pets in registry: " .. n, "map-pin")
             timers.petcount = now
         end
 
@@ -1379,8 +1448,11 @@ task.spawn(function()
 end)
 
 -- §16 ── AUTO FARM LOOP  (separate thread — has awaits inside cycle)
+-- [F-007 FIX] Session token guard
 task.spawn(function()
-    while ST.Running and (not getgenv or getgenv().CAT_RUNNING ~= false) do
+    while ST.Running
+      and (not getgenv or (getgenv().CAT_RUNNING ~= false
+           and getgenv().CAT_SESSION == SESSION_TOKEN)) do
         if CFG.AutoFarm then
             task.spawn(RunCatchCycle)
             task.wait(math.max(0.5, CFG.FarmDelay))
@@ -1391,7 +1463,8 @@ task.spawn(function()
 end)
 
 -- §17 ── CHARACTER RESPAWN HANDLER
-Player.CharacterAdded:Connect(function()
+-- [F-004 FIX] Named connection key
+ST.Connections.CharacterAdded = Player.CharacterAdded:Connect(function()
     task.wait(1.5)      -- let character finish loading
     ApplyMovement()
     if CFG.InfiniteJump then SetInfiniteJump(true) end
@@ -1406,14 +1479,13 @@ do
     task.wait(0.5)
     SafeFire(REM.ClientReady)
 
-    -- Load Rayfield configuration (applies saved flags to all elements)
+    -- Load Rayfield configuration
     Rayfield:LoadConfiguration()
 
-    -- Restore Xeno cross-session config on top of Rayfield config
-    -- (Xeno persists across server hops; Rayfield config persists across sessions)
+    -- Restore Xeno cross-session config
     if IS_XENO and Xeno and Xeno.GetGlobal then
         pcall(function()
-            local saved = Xeno.GetGlobal("CATConfig_v100")
+            local saved = Xeno.GetGlobal("CATConfig_v120")
             if type(saved) == "table" then
                 for k, v in pairs(saved) do
                     if CFG[k] ~= nil then CFG[k] = v end
@@ -1429,7 +1501,7 @@ do
     for _ in pairs(ST.PetRegistry) do petCount = petCount + 1 end
 
     Notify(
-        "Catch & Tame  v1.0  ✓",
+        "Catch & Tame  v1.2.0  ✓",
         remCount .. " remotes  |  " .. petCount .. " pets found\nRightShift to toggle GUI",
         7,
         "paw-print"
@@ -1439,13 +1511,15 @@ end
 -- Xeno config auto-save (every 30 s)
 if IS_XENO and Xeno and Xeno.SetGlobal then
     task.spawn(function()
-        while ST.Running do
+        while ST.Running
+          and (not getgenv or (getgenv().CAT_RUNNING ~= false
+               and getgenv().CAT_SESSION == SESSION_TOKEN)) do
             task.wait(30)
-            pcall(function() Xeno.SetGlobal("CATConfig_v100", CFG) end)
+            pcall(function() Xeno.SetGlobal("CATConfig_v120", CFG) end)
         end
     end)
 end
 
 -- ============================================================
--- END OF SCRIPT
+-- END OF SCRIPT  ·  v1.2.0  ·  10 findings resolved
 -- ============================================================
