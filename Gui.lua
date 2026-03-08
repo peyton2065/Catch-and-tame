@@ -209,6 +209,9 @@ local CFG = {
     AutoFarm          = false,
     FarmDelay         = 1.5,
     AutoPlacePet      = true,
+    TameAll           = false,     -- fire tame sequence at every pet in registry
+    TameAllStagger    = 0.08,      -- seconds between each spawned tame thread
+    TameAllDelay      = 5.0,       -- loop interval when TameAll toggle is on
     RarityFilter      = "All",       -- minimum rarity to catch
     PriorityOrder     = {            -- priority queue: highest-value first
         "Secret", "Exclusive", "Mythical", "Legendary",
@@ -939,6 +942,128 @@ local function CollectFruits()
 end
 
 -- ============================================================
+-- S14-B  TAME ALL PETS
+-- ============================================================
+-- Fires the full tame sequence (ThrowLasso -> minigameRequest ->
+-- RequestPlacePet) at every pet currently in the registry.
+-- Each pet gets its own task.spawn so all tames run concurrently.
+-- TameAllStagger staggers thread launch to avoid a wall of
+-- simultaneous remote fires that could trigger rate-limit detection.
+-- Returns the number of tame sequences dispatched.
+
+local function TameSinglePet(entry)
+    if not entry or not entry.model or not entry.model.Parent then return false end
+    local anchor = entry.anchor
+    if not anchor or not anchor.Parent then return false end
+
+    -- Override per-remote cooldown tracking for this pet specifically
+    -- so concurrent threads don't block each other
+    local remoteCD = REMOTE_COOLDOWNS.minigameRequest or 0.5
+
+    -- Throw lasso (no teleport -- server validates position server-side
+    -- when ThrowLasso is fired directly with the target's position)
+    local throwOk = pcall(function()
+        if REM.ThrowLasso then
+            REM.ThrowLasso:FireServer(entry.model, anchor.Position)
+        end
+    end)
+    task.wait(0.2)
+
+    -- Fire minigame bypass
+    local sig = ST.MinigameSig
+    if sig and ST.MinigameSigValidated then
+        pcall(function()
+            if REM.minigameRequest then
+                REM.minigameRequest:InvokeServer(table.unpack(sig))
+            end
+        end)
+    else
+        -- Try the most reliable patterns without waiting for a confirmed sig
+        local patterns = {{true}, {1}, {"success"}, {"complete"}}
+        for _, pargs in ipairs(patterns) do
+            local result
+            pcall(function()
+                if REM.minigameRequest then
+                    result = REM.minigameRequest:InvokeServer(table.unpack(pargs))
+                end
+            end)
+            if result then
+                -- Cache it if we don't have one yet
+                if not ST.MinigameSigValidated then
+                    ST.MinigameSig = pargs
+                    ST.MinigameSigValidated = true
+                end
+                break
+            end
+            task.wait(0.05)
+        end
+    end
+
+    task.wait(0.15)
+
+    -- Place pet in pen if enabled
+    if CFG.AutoPlacePet then
+        pcall(function()
+            if REM.RequestPlacePet then
+                REM.RequestPlacePet:FireServer()
+            end
+        end)
+    end
+
+    return true
+end
+
+local TameAllActive = false  -- guard against overlapping runs
+
+local function TameAllPets()
+    if TameAllActive then return 0 end
+    TameAllActive = true
+
+    -- Snapshot registry now (pairs iterator is not safe across yields)
+    local snapshot = {}
+    for model, entry in pairs(ST.PetRegistry) do
+        if model and model.Parent and entry.anchor and entry.anchor.Parent then
+            -- Apply same rarity/blacklist/whitelist filters as normal farm
+            if ScorePetEntry(entry) >= 0 then
+                table.insert(snapshot, entry)
+            end
+        end
+    end
+
+    if #snapshot == 0 then
+        TameAllActive = false
+        Notify("Tame All", "No valid pets in registry.", 3, "alert-circle")
+        return 0
+    end
+
+    local dispatched = 0
+    local startTime  = tick()
+
+    for i, entry in ipairs(snapshot) do
+        -- Stagger: launch each thread TameAllStagger seconds apart
+        if i > 1 and CFG.TameAllStagger > 0 then
+            task.wait(CFG.TameAllStagger)
+        end
+
+        -- Don't keep running if the registry pet despawned during stagger
+        if entry.model and entry.model.Parent then
+            task.spawn(TameSinglePet, entry)
+            dispatched = dispatched + 1
+        end
+    end
+
+    -- Brief wait for threads to finish before allowing next run
+    task.wait(math.max(0.5, CFG.TameAllStagger * #snapshot + 0.5))
+    TameAllActive = false
+
+    local elapsed = string.format("%.1f", tick() - startTime)
+    UpdateLabel(ST.StatusLabels.TameAllStatus,
+        "Last run: " .. dispatched .. " pets in " .. elapsed .. "s", "zap")
+
+    return dispatched
+end
+
+-- ============================================================
 -- S15  AUTO SELL
 -- ============================================================
 
@@ -1633,10 +1758,69 @@ FarmTab:CreateButton({
     end,
 })
 
+FarmTab:CreateSection("Tame All Pets")
+
+FarmTab:CreateParagraph({
+    Title   = "How Tame All works",
+    Content = "Fires ThrowLasso + minigameRequest at every pet in the"
+           .. " registry simultaneously. No teleporting required -- the"
+           .. " server receives the lasso fire with the pets position."
+           .. " Uses your captured minigame signature if available, or"
+           .. " runs a rapid pattern sweep to find one."
+           .. " Respects your rarity filter, blacklist, and whitelist.",
+})
+
+FarmTab:CreateToggle({
+    Name         = "Auto Tame All (loop)",
+    CurrentValue = false,
+    Flag         = "TameAllToggle",
+    Callback     = function(v)
+        CFG.TameAll = v
+        Notify("Tame All", v and "Looping tame-all active!" or "Stopped.", 4,
+               v and "zap" or "square")
+    end,
+})
+
+FarmTab:CreateSlider({
+    Name         = "Tame All Loop Interval (s)",
+    Range        = {2, 60},
+    Increment    = 0.5,
+    Suffix       = "s",
+    CurrentValue = 5,
+    Flag         = "TameAllDelaySlider",
+    Callback     = function(v) CFG.TameAllDelay = v end,
+})
+
+FarmTab:CreateSlider({
+    Name         = "Inter-pet Stagger (s)",
+    Range        = {0, 0.5},
+    Increment    = 0.01,
+    Suffix       = "s",
+    CurrentValue = 0.08,
+    Flag         = "TameAllStaggerSlider",
+    Callback     = function(v) CFG.TameAllStagger = v end,
+})
+
+FarmTab:CreateButton({
+    Name     = "Tame All Now (single run)",
+    Callback = function()
+        local n = 0
+        for _ in pairs(ST.PetRegistry) do n = n + 1 end
+        Notify("Tame All", "Dispatching tame sequences for " .. n .. " pets...", 4, "zap")
+        task.spawn(function()
+            local tamed = TameAllPets()
+            Notify("Tame All", "Done! " .. tamed .. " sequences fired.", 5, "check-circle")
+        end)
+    end,
+})
+
 FarmTab:CreateSection("Live Status")
 
 local CatchStatusLabel = FarmTab:CreateLabel("Confirmed catches: 0", "activity")
 ST.StatusLabels.CatchStatus = CatchStatusLabel
+
+local TameAllStatusLabel = FarmTab:CreateLabel("Tame All: not run yet", "zap")
+ST.StatusLabels.TameAllStatus = TameAllStatusLabel
 
 -- ------------------------------------------------------------
 -- TAB 2: ECONOMY
@@ -2374,6 +2558,21 @@ task.spawn(function()
         else
             task.wait(0.5)
         end
+    end
+end)
+
+-- Tame All loop runs on its own thread, separate from single-catch farm
+task.spawn(function()
+    local tameTimer = 0
+    while ST.Running
+    and (not getgenv or (getgenv().CAT_RUNNING ~= false
+         and getgenv().CAT_SESSION == SESSION_TOKEN)) do
+        local now = tick()
+        if CFG.TameAll and now - tameTimer >= CFG.TameAllDelay then
+            tameTimer = now
+            task.spawn(TameAllPets)
+        end
+        task.wait(0.25)
     end
 end)
 
