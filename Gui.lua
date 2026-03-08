@@ -136,6 +136,7 @@ if not newcclosure     then newcclosure     = function(f) return f end end
 if not checkcaller     then checkcaller     = function() return false end end
 if not getrawmetatable then getrawmetatable = function() return nil end end
 if not iscclosure      then iscclosure      = function() return false end end
+if not getconnections  then getconnections  = function() return {} end end
 
 -- ============================================================
 -- S3  CLEANUP + SESSION TOKEN
@@ -962,14 +963,17 @@ local function TameSinglePet(entry)
 
     -- Throw lasso (no teleport -- server validates position server-side
     -- when ThrowLasso is fired directly with the target's position)
-    local throwOk = pcall(function()
+    pcall(function()
         if REM.ThrowLasso then
             REM.ThrowLasso:FireServer(entry.model, anchor.Position)
         end
     end)
     task.wait(0.2)
 
-    -- Fire minigame bypass
+    -- Solve minigame: GUI watcher + remote bypass in parallel
+    task.spawn(function()
+        WatchAndClickMinigameGUI(3.5)
+    end)
     local sig = ST.MinigameSig
     if sig and ST.MinigameSigValidated then
         pcall(function()
@@ -978,7 +982,6 @@ local function TameSinglePet(entry)
             end
         end)
     else
-        -- Try the most reliable patterns without waiting for a confirmed sig
         local patterns = {{true}, {1}, {"success"}, {"complete"}}
         for _, pargs in ipairs(patterns) do
             local result
@@ -988,7 +991,6 @@ local function TameSinglePet(entry)
                 end
             end)
             if result then
-                -- Cache it if we don't have one yet
                 if not ST.MinigameSigValidated then
                     ST.MinigameSig = pargs
                     ST.MinigameSigValidated = true
@@ -1146,6 +1148,191 @@ end
 -- S17  MINIGAME + CORE CATCH CYCLE
 -- ============================================================
 
+-- Keywords that identify the confirm/success button in the minigame GUI.
+-- The watcher checks button names and text against these strings.
+local MINIGAME_BUTTON_KEYWORDS = {
+    "catch", "tame", "confirm", "success", "win",
+    "click", "press", "submit", "complete", "done",
+    "ok", "yes", "grab", "lasso", "capture",
+}
+
+-- Fire every connection on a signal (MouseButton1Click / Activated).
+-- Falls back to :Fire() if getconnections is unavailable.
+local function FireButtonConnections(button)
+    -- Method 1: getconnections (preferred -- calls the actual handler functions)
+    local conns = getconnections(button.MouseButton1Click)
+    if conns and #conns > 0 then
+        for _, conn in ipairs(conns) do
+            pcall(function() conn:Fire() end)
+        end
+        return true
+    end
+
+    -- Method 2: Activated signal
+    conns = getconnections(button.Activated)
+    if conns and #conns > 0 then
+        for _, conn in ipairs(conns) do
+            pcall(function() conn:Fire() end)
+        end
+        return true
+    end
+
+    -- Method 3: Direct Fire on the signal (works on some executors)
+    pcall(function() button.MouseButton1Click:Fire() end)
+    pcall(function() button.Activated:Fire() end)
+    return false
+end
+
+-- Returns true if a button name or text matches known minigame keywords.
+local function IsMinigameButton(button)
+    local name = button.Name:lower()
+    local text = ""
+    pcall(function() text = button.Text:lower() end)
+
+    for _, kw in ipairs(MINIGAME_BUTTON_KEYWORDS) do
+        if name:find(kw) or text:find(kw) then return true end
+    end
+    return false
+end
+
+-- Recursively collect all TextButton / ImageButton descendants.
+local function CollectButtons(parent, out)
+    out = out or {}
+    for _, child in ipairs(parent:GetDescendants()) do
+        if child:IsA("TextButton") or child:IsA("ImageButton") then
+            table.insert(out, child)
+        end
+    end
+    return out
+end
+
+-- Try to click any actionable element inside a GUI container.
+-- Returns true if at least one click was fired.
+local function ClickGuiContents(guiObj)
+    local clicked = false
+
+    -- ProximityPrompts inside the GUI (rare but possible)
+    for _, prompt in ipairs(guiObj:GetDescendants()) do
+        if prompt:IsA("ProximityPrompt") then
+            pcall(fireproximityprompt, prompt)
+            clicked = true
+        end
+    end
+
+    local buttons = CollectButtons(guiObj)
+    if #buttons == 0 then return clicked end
+
+    -- Pass 1: look for a button that matches minigame keywords
+    for _, btn in ipairs(buttons) do
+        if IsMinigameButton(btn) and btn.Visible then
+            FireButtonConnections(btn)
+            clicked = true
+        end
+    end
+
+    -- Pass 2: if no keyword match, click the first visible button
+    -- (the minigame may only have one button, so this is safe)
+    if not clicked then
+        for _, btn in ipairs(buttons) do
+            if btn.Visible then
+                FireButtonConnections(btn)
+                clicked = true
+                break
+            end
+        end
+    end
+
+    return clicked
+end
+
+-- Core watcher. Called after ThrowLasso fires.
+-- Monitors PlayerGui (and CoreGui) for the minigame screen for up to
+-- `timeout` seconds, clicks whatever it finds, and also fires the
+-- minigameRequest remote in parallel so both paths are covered.
+local function WatchAndClickMinigameGUI(timeout)
+    timeout = timeout or 4
+    local deadline = tick() + timeout
+    local clicked  = false
+
+    -- Snapshot existing GUIs so we only react to NEW ones
+    local knownGUIs = {}
+    local pg = Player:FindFirstChild("PlayerGui")
+    if pg then
+        for _, g in ipairs(pg:GetChildren()) do knownGUIs[g] = true end
+    end
+    for _, g in ipairs(CoreGui:GetChildren()) do knownGUIs[g] = true end
+
+    -- Also try clicking in any GUI that already exists and looks like a minigame
+    -- (handles GUIs that were added before we started watching)
+    local function ScanExisting()
+        if pg then
+            for _, g in ipairs(pg:GetChildren()) do
+                if not knownGUIs[g] then
+                    if ClickGuiContents(g) then clicked = true end
+                end
+            end
+        end
+    end
+
+    -- Poll loop
+    while tick() < deadline and not clicked do
+        -- Check PlayerGui for new ScreenGuis
+        if pg then
+            for _, g in ipairs(pg:GetChildren()) do
+                if not knownGUIs[g] then
+                    -- New GUI appeared -- try clicking it immediately
+                    task.wait(0.05)  -- tiny wait for GUI to finish populating
+                    if ClickGuiContents(g) then
+                        clicked = true
+                        break
+                    end
+                    knownGUIs[g] = true  -- mark so we don't retry
+                end
+            end
+        end
+
+        -- Check CoreGui for new elements
+        if not clicked then
+            for _, g in ipairs(CoreGui:GetChildren()) do
+                if not knownGUIs[g] then
+                    task.wait(0.05)
+                    if ClickGuiContents(g) then
+                        clicked = true
+                        break
+                    end
+                    knownGUIs[g] = true
+                end
+            end
+        end
+
+        -- Also check ProximityPrompts on the pet itself each tick
+        -- (some games use a world-space prompt instead of a ScreenGui)
+        if not clicked and ST.NearestPet and ST.NearestPet.Parent then
+            for _, prompt in ipairs(ST.NearestPet:GetDescendants()) do
+                if prompt:IsA("ProximityPrompt") then
+                    pcall(fireproximityprompt, prompt)
+                    clicked = true
+                    break
+                end
+            end
+            -- ClickDetectors on the pet
+            if not clicked then
+                for _, cd in ipairs(ST.NearestPet:GetDescendants()) do
+                    if cd:IsA("ClickDetector") then
+                        pcall(fireclickdetector, cd)
+                        clicked = true
+                        break
+                    end
+                end
+            end
+        end
+
+        if not clicked then task.wait(0.08) end
+    end
+
+    return clicked
+end
+
 local function SolveTamingMinigame()
     if ST.MinigameSig and ST.MinigameSigValidated then
         return SafeCall(REM.minigameRequest, table.unpack(ST.MinigameSig))
@@ -1219,11 +1406,18 @@ local function RunCatchCycle()
     -- Throw lasso
     ST.Stats.CatchAttempts = ST.Stats.CatchAttempts + 1
     local thrown = ThrowLassoAt(entry.model, anchor)
-    task.wait(Jitter(0.35))
+    task.wait(Jitter(0.25))
 
-    -- Solve minigame
+    -- Solve minigame: run GUI watcher and remote bypass in parallel.
+    -- WatchAndClickMinigameGUI handles UI-based minigames (button appears
+    -- on screen after the lasso lands). SolveTamingMinigame handles
+    -- remote-based bypass once a signature is captured.
+    -- Both run concurrently so whichever path the game uses is covered.
+    task.spawn(function()
+        WatchAndClickMinigameGUI(3.5)
+    end)
     SolveTamingMinigame()
-    task.wait(Jitter(0.3))
+    task.wait(Jitter(0.35))
 
     -- Place pet in pen
     if CFG.AutoPlacePet then
