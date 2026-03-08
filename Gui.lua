@@ -950,23 +950,21 @@ local function SellPets()
     local sold = 0
 
     for _, petData in pairs(inventory) do
-        if type(petData) ~= "table" then goto continue end
+        if type(petData) == "table" then
+            -- Try to determine rarity from petData fields
+            local rarStr = petData.rarity or petData.Rarity
+                        or petData.tier   or petData.Tier or ""
+            local tier = GetTierFromString(tostring(rarStr))
 
-        -- Try to determine rarity from petData fields
-        local rarStr = petData.rarity or petData.Rarity
-                    or petData.tier   or petData.Tier or ""
-        local tier = GetTierFromString(tostring(rarStr))
-
-        if tier < threshold and tier > 0 then
-            local result = SafeInvoke(REM.sellPet, petData)
-            if result == nil then
-                SafeFire(REM.SellPets, petData)
+            if tier < threshold and tier > 0 then
+                local result = SafeInvoke(REM.sellPet, petData)
+                if result == nil then
+                    SafeFire(REM.SellPets, petData)
+                end
+                sold = sold + 1
+                task.wait(Jitter(0.25))
             end
-            sold = sold + 1
-            task.wait(Jitter(0.25))
         end
-
-        ::continue::
     end
 
     if sold > 0 then
@@ -996,14 +994,14 @@ local function SmartBreedCycle()
         -- Build rarity buckets
         local buckets = {}
         for _, petData in pairs(inventory) do
-            if type(petData) ~= "table" then goto skip end
-            local rarStr = petData.rarity or petData.Rarity or ""
-            local tier = GetTierFromString(tostring(rarStr))
-            if tier > 0 then
-                if not buckets[tier] then buckets[tier] = {} end
-                table.insert(buckets[tier], petData)
+            if type(petData) == "table" then
+                local rarStr = petData.rarity or petData.Rarity or ""
+                local tier = GetTierFromString(tostring(rarStr))
+                if tier > 0 then
+                    if not buckets[tier] then buckets[tier] = {} end
+                    table.insert(buckets[tier], petData)
+                end
             end
-            ::skip::
         end
 
         -- Breed pairs within same tier
@@ -1168,13 +1166,12 @@ local function FeedAllPets()
     local fed = 0
     for _, petData in pairs(inventory) do
         -- Skip non-table entries (metadata fields)
-        if type(petData) ~= "table" then goto skip end
-        -- Skip if it has no pet-like fields
-        if not (petData.id or petData.Id or petData.petId or petData.name) then goto skip end
-        SafeInvoke(REM.FeedPet, petData)
-        fed = fed + 1
-        task.wait(Jitter(0.09))
-        ::skip::
+        if type(petData) == "table"
+        and (petData.id or petData.Id or petData.petId or petData.name) then
+            SafeInvoke(REM.FeedPet, petData)
+            fed = fed + 1
+            task.wait(Jitter(0.09))
+        end
     end
     if fed == 0 then
         Notify("Feed", "No feedable pets found.", 3, "alert-circle")
@@ -1361,25 +1358,26 @@ local function UpdateESP()
     for model, obj in pairs(ST.ESPObjects) do
         if model and model.Parent and obj.gui and obj.gui.Parent then
             local entry = ST.PetRegistry[model]
-            if not entry then stale[#stale + 1] = {m = model, o = obj}; goto next end
-
-            local anchor = entry.anchor
-            if root and anchor and anchor.Parent then
-                local dist = math.floor(GetDistance(root.Position, anchor.Position))
-                pcall(function()
-                    obj.dist.Text = dist .. " st"
-                    local color = GetESPColor(entry)
-                    if CFG.HighlightNearest and ST.NearestPet == model then
-                        obj.name.TextColor3 = Color3.fromRGB(255, 255, 80)
-                    else
-                        obj.name.TextColor3 = color
-                    end
-                end)
+            if entry then
+                local anchor = entry.anchor
+                if root and anchor and anchor.Parent then
+                    local dist = math.floor(GetDistance(root.Position, anchor.Position))
+                    pcall(function()
+                        obj.dist.Text = dist .. " st"
+                        local color = GetESPColor(entry)
+                        if CFG.HighlightNearest and ST.NearestPet == model then
+                            obj.name.TextColor3 = Color3.fromRGB(255, 255, 80)
+                        else
+                            obj.name.TextColor3 = color
+                        end
+                    end)
+                end
+            else
+                stale[#stale + 1] = {m = model, o = obj}
             end
         else
             stale[#stale + 1] = {m = model, o = obj}
         end
-        ::next::
     end
 
     for _, e in ipairs(stale) do
