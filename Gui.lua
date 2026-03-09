@@ -1,86 +1,74 @@
 -- ============================================================
---   CATCH & TAME  |  ADVANCED OPERATION SCRIPT v2.0
---   Version  : 2.0.0
+--   CATCH & TAME  |  ADVANCED OPERATION SCRIPT v3.0
+--   Version  : 3.0.0
 --   Executor : Xeno (UNC compatible)
 --   PlaceId  : 96645548064314
 --   Author   : ENI
 --   Load via : XenoScanner v4.2 Bootstrap
 -- ============================================================
 -- CHANGELOG
---   v2.0.0  Full rewrite -- see enhancement plan
---     + Weather monitor system with event detection and countdown
---     + Auto Fruit Collect (Volcanic / Cosmic fruits)
---     + Priority catch queue (ranked rarity, stops on first match)
---     + Mutation detection and filter (catch mutated only)
---     + Auto Sell pets and eggs by rarity threshold
---     + Smart Breed (recipe pair scanner, rarity match)
---     + Pet name blacklist and whitelist
---     + Session analytics (catches/hr, success rate, income/sec)
---     + ESP rarity color coding and mutation badges
---     + Lazy remote cache with DescendantAdded watcher
---     + Catch confirmation via inventory count delta
---     + Extended namecall hook captures ALL remote signatures
---     + Anti-detection: jitter on all timers, per-remote cooldown map
---     + Human Mode toggle for randomized action delays
---     + Lateral teleport approach vector (no hitbox clipping)
---     + Rarity filter actually connected to catch logic
---     + Minigame signature validates win before caching
---     + FeedAllPets skips non-table metadata keys
---     + Session stats track confirmed catches only
---     ! FIX: All characters are plain ASCII (no em dashes, Unicode, etc.)
+--   v3.0.0  Full architectural rewrite
+--     + Multi-rarity hunt select (per-rarity toggle panel)
+--     + Recipe Auto Breed (known pair table + name-match + rarity fallback)
+--     + Fruit hold-timer bypass (HoldDuration = 0 before fireproximityprompt)
+--     + Worker pool semaphore for TameAll (max 8 concurrent threads)
+--     + NormalizePetData() canonical inventory normalization
+--     + Remote ring buffer (last 50 calls, printable from Stats tab)
+--     + RenderStepped-based ESP distance updates (zero catch-loop overhead)
+--     + Debounced config auto-save (saves 2s after any change)
+--     + Pen pet cache via ChildAdded/ChildRemoved (no GetDescendants in feed)
+--     + Human Mode delays properly scaled per action category
+--     ~ All v2.0 features preserved and fully functional
+--     ! FIX: 100% plain ASCII output
 -- ============================================================
 
-print("[CAT] Catch & Tame v2.0.0 loading...")
+print("[CAT] Catch & Tame v3.0.0 loading...")
 
 -- ============================================================
 -- S0  CONSTANTS
 -- ============================================================
 
-local VERSION       = "2.0.0"
+local VERSION       = "3.0.0"
 local SCRIPT_NAME   = "Catch & Tame"
 local PLACE_ID      = 96645548064314
 local RAYFIELD_URL  = "https://sirius.menu/rayfield"
 
--- Rarity tier definitions (name match patterns -> tier value)
--- Higher tier = higher priority
+-- Rarity tiers: name -> tier integer (higher = more valuable)
 local RARITY_TIERS = {
-    ["Secret"]      = 8,
-    ["Exclusive"]   = 7,
-    ["Mythical"]    = 6,
-    ["Legendary"]   = 5,
-    ["Epic"]        = 4,
-    ["Rare"]        = 3,
-    ["Uncommon"]    = 2,
-    ["Common"]      = 1,
+    ["Secret"]    = 8,
+    ["Exclusive"] = 7,
+    ["Mythical"]  = 6,
+    ["Legendary"] = 5,
+    ["Epic"]      = 4,
+    ["Rare"]      = 3,
+    ["Uncommon"]  = 2,
+    ["Common"]    = 1,
 }
 
--- Rarity tier -> ESP color (RGB)
+-- Tier integer -> display name (reverse map, built at runtime)
+local TIER_NAMES = {}
+for k, v in pairs(RARITY_TIERS) do TIER_NAMES[v] = k end
+
+-- Tier -> ESP color
 local RARITY_COLORS = {
-    [8] = Color3.fromRGB(255, 30,  30),   -- Secret      : red
-    [7] = Color3.fromRGB(255, 140, 0),    -- Exclusive   : orange
-    [6] = Color3.fromRGB(180, 0,   255),  -- Mythical    : purple
-    [5] = Color3.fromRGB(255, 210, 0),    -- Legendary   : gold
-    [4] = Color3.fromRGB(180, 60,  255),  -- Epic        : violet
-    [3] = Color3.fromRGB(60,  120, 255),  -- Rare        : blue
-    [2] = Color3.fromRGB(60,  200, 80),   -- Uncommon    : green
-    [1] = Color3.fromRGB(200, 200, 200),  -- Common      : grey
+    [8] = Color3.fromRGB(255, 30,  30),   -- Secret    : red
+    [7] = Color3.fromRGB(255, 140, 0),    -- Exclusive : orange
+    [6] = Color3.fromRGB(180, 0,   255),  -- Mythical  : purple
+    [5] = Color3.fromRGB(255, 210, 0),    -- Legendary : gold
+    [4] = Color3.fromRGB(180, 60,  255),  -- Epic      : violet
+    [3] = Color3.fromRGB(60,  120, 255),  -- Rare      : blue
+    [2] = Color3.fromRGB(60,  200, 80),   -- Uncommon  : green
+    [1] = Color3.fromRGB(200, 200, 200),  -- Common    : grey
 }
 
--- Mutation keywords to detect in pet model
+-- Mutation keywords detected in pet model names / attributes
 local MUTATION_KEYWORDS = {
     "Cosmic", "Volcanic", "Shocked", "Frozen",
     "Charged", "Toxic", "Shadow", "Radiant",
     "Crystal", "Infernal", "Spectral", "Gilded",
 }
 
--- Weather states the game cycles through
-local WEATHER_NAMES = {
-    "Clear", "Rainy", "Thunderstorm", "Sandstorm",
-    "Blizzard", "Snowy", "Cosmic", "Volcanic",
-    "Foggy", "Windy",
-}
-
--- Weather -> mythical pets that spawn in it
+-- Weather names and per-weather special spawns
 local WEATHER_PETS = {
     ["Thunderstorm"] = {"Lightning Dragon"},
     ["Sandstorm"]    = {"Griffin", "Basilisk"},
@@ -89,31 +77,59 @@ local WEATHER_PETS = {
     ["Volcanic"]     = {"Lava Golem", "Phoenix"},
 }
 
--- Skeleton event interval (seconds)
-local SKELETON_INTERVAL = 3600  -- every 60 minutes
-local SKELETON_DURATION = 1200  -- lasts 20 minutes
-
--- Per-remote fire cooldowns in seconds (mirrors known server limits)
-local REMOTE_COOLDOWNS = {
-    UpdateProgress     = 0.08,  -- minigame complete: FireServer(100) [RemoteEvent]
-    minigameRequest    = 0.5,   -- legacy fallback [RemoteFunction]
-    extendFence        = 1.0,
-    getEggInventory    = 0.5,
-    GetActiveWeather   = 2.0,
-    CancelMinigame     = 0.5,
-    ThrowLasso         = 0.4,
-    collectAllPetCash  = 2.0,
-    FeedPet            = 0.15,
-    BuyFood            = 1.0,
-    InstantHatch       = 1.0,
-    breedRequest       = 2.0,
-    ClaimLoginReward   = 1.0,
-    UseSpin            = 0.5,
-    UseTotem           = 1.0,
-    sellPet            = 0.2,
-    sellEgg            = 0.2,
-    redeemCode         = 1.0,
+-- Recipe Auto Breed: known pet pair -> output hint
+-- Keys are sorted alphabetically so lookup order doesn't matter.
+-- SmartBreedCycle scans inventory for both members of a pair and breeds them.
+-- Add entries as you discover new combos. Format: "PetA|PetB" = "Output (optional)"
+local BREED_RECIPES = {
+    ["Griffin|Griffin"]               = "Mythical Griffin",
+    ["Cosmic Griffin|Griffin"]        = "Secret Griffin",
+    ["Frost Dragon|Ice Dragon"]       = "Blizzard Dragon",
+    ["Phoenix|Lava Golem"]            = "Volcanic Phoenix",
+    ["Lightning Dragon|Storm Dragon"] = "Thunder Drake",
+    ["Yeti|Frost Dragon"]             = "Glacial Yeti",
+    ["Basilisk|Griffin"]              = "Sand Basilisk",
+    ["Shadow Wolf|Dark Wolf"]         = "Void Wolf",
 }
+
+-- Skeleton event timing constants
+local SKELETON_INTERVAL = 3600   -- fires approximately every 60 min
+local SKELETON_DURATION = 1200   -- active for ~20 min
+
+-- Lateral approach offset (studs behind target, avoids hitbox clip)
+local LATERAL_OFFSET_STUDS = 6
+
+-- Per-remote fire cooldowns (mirrors known server rate limits)
+local REMOTE_COOLDOWNS = {
+    UpdateProgress    = 0.08,
+    minigameRequest   = 0.5,
+    extendFence       = 1.0,
+    getEggInventory   = 0.5,
+    GetActiveWeather  = 2.0,
+    CancelMinigame    = 0.5,
+    ThrowLasso        = 0.4,
+    collectAllPetCash = 2.0,
+    FeedPet           = 0.15,
+    BuyFood           = 1.0,
+    InstantHatch      = 1.0,
+    breedRequest      = 2.0,
+    ClaimLoginReward  = 1.0,
+    UseSpin           = 0.5,
+    UseTotem          = 1.0,
+    sellPet           = 0.2,
+    sellEgg           = 0.2,
+    redeemCode        = 1.0,
+}
+
+-- Minigame button keywords for GUI watcher fallback
+local MINIGAME_BUTTON_KEYWORDS = {
+    "catch", "tame", "confirm", "success", "win",
+    "click", "press", "submit", "complete", "done",
+    "ok", "yes", "grab", "lasso", "capture",
+}
+
+-- Worker pool: max simultaneous TameAll goroutines
+local TAME_POOL_MAX = 8
 
 -- ============================================================
 -- S1  EXECUTOR DETECTION
@@ -122,12 +138,12 @@ local REMOTE_COOLDOWNS = {
 local IS_XENO = false
 do
     local name = ""
-    if identifyexecutor then name = identifyexecutor():lower()
+    if identifyexecutor  then name = identifyexecutor():lower()
     elseif getexecutorname then name = getexecutorname():lower() end
     IS_XENO = name:find("xeno") ~= nil or (typeof(Xeno) == "table")
 end
-local EXECUTOR_NAME = (identifyexecutor and identifyexecutor())
-                   or (getexecutorname and getexecutorname())
+local EXECUTOR_NAME = (identifyexecutor  and identifyexecutor())
+                   or (getexecutorname  and getexecutorname())
                    or "Unknown"
 
 -- ============================================================
@@ -135,13 +151,23 @@ local EXECUTOR_NAME = (identifyexecutor and identifyexecutor())
 -- ============================================================
 
 if not cloneref        then cloneref        = function(o) return o end end
-if not getnilinstances then getnilinstances  = function() return {} end end
+if not getnilinstances then getnilinstances = function() return {} end end
 if not getinstances    then getinstances    = function() return {} end end
 if not newcclosure     then newcclosure     = function(f) return f end end
 if not checkcaller     then checkcaller     = function() return false end end
 if not getrawmetatable then getrawmetatable = function() return nil end end
 if not iscclosure      then iscclosure      = function() return false end end
 if not getconnections  then getconnections  = function() return {} end end
+if not fireproximityprompt then
+    fireproximityprompt = function(p)
+        pcall(function() p:InputBegan(Enum.ProximityPromptInputType.Gamepad, false) end)
+    end
+end
+if not fireclickdetector then
+    fireclickdetector = function(cd)
+        pcall(function() cd.MouseClick:Fire() end)
+    end
+end
 
 -- ============================================================
 -- S3  CLEANUP + SESSION TOKEN
@@ -185,15 +211,15 @@ end
 -- S4  SERVICES
 -- ============================================================
 
-local Players           = cloneref(game:GetService("Players"))
-local ReplicatedStorage = cloneref(game:GetService("ReplicatedStorage"))
-local RunService        = cloneref(game:GetService("RunService"))
-local TweenService      = cloneref(game:GetService("TweenService"))
-local UserInputService  = cloneref(game:GetService("UserInputService"))
-local VirtualUser       = cloneref(game:GetService("VirtualUser"))
-local CoreGui           = cloneref(game:GetService("CoreGui"))
-local Workspace         = cloneref(game:GetService("Workspace"))
-local MarketplaceService = cloneref(game:GetService("MarketplaceService"))
+local Players            = cloneref(game:GetService("Players"))
+local ReplicatedStorage  = cloneref(game:GetService("ReplicatedStorage"))
+local RunService         = cloneref(game:GetService("RunService"))
+local TweenService       = cloneref(game:GetService("TweenService"))
+local UserInputService   = cloneref(game:GetService("UserInputService"))
+local VirtualUser        = cloneref(game:GetService("VirtualUser"))
+local CoreGui            = cloneref(game:GetService("CoreGui"))
+local Workspace          = cloneref(game:GetService("Workspace"))
+local HttpService        = cloneref(game:GetService("HttpService"))
 
 -- ============================================================
 -- S5  PLAYER REFERENCES
@@ -202,8 +228,8 @@ local MarketplaceService = cloneref(game:GetService("MarketplaceService"))
 local Player = Players.LocalPlayer
 local Camera = Workspace.CurrentCamera
 
-local function GetChar()    return Player.Character end
-local function GetRoot()    local c = GetChar(); return c and c:FindFirstChild("HumanoidRootPart") end
+local function GetChar()     return Player.Character end
+local function GetRoot()     local c = GetChar(); return c and c:FindFirstChild("HumanoidRootPart") end
 local function GetHumanoid() local c = GetChar(); return c and c:FindFirstChildOfClass("Humanoid") end
 
 -- ============================================================
@@ -215,21 +241,32 @@ local CFG = {
     AutoFarm          = false,
     FarmDelay         = 1.5,
     AutoPlacePet      = true,
-    TameAll           = false,     -- fire tame sequence at every pet in registry
-    TameAllStagger    = 0.08,      -- seconds between each spawned tame thread
-    TameAllDelay      = 5.0,       -- loop interval when TameAll toggle is on
-    RarityFilter      = "All",       -- minimum rarity to catch
-    PriorityOrder     = {            -- priority queue: highest-value first
-        "Secret", "Exclusive", "Mythical", "Legendary",
-        "Epic", "Rare", "Uncommon", "Common"
+    TameAll           = false,
+    TameAllStagger    = 0.08,
+    TameAllDelay      = 5.0,
+
+    -- v3: Multi-rarity hunt select.
+    -- All false = catch anything meeting MinRarity floor.
+    -- Any true  = ONLY catch tiers that are true (whitelist overrides).
+    HuntRarities = {
+        Secret    = false,
+        Exclusive = false,
+        Mythical  = false,
+        Legendary = false,
+        Epic      = false,
+        Rare      = false,
+        Uncommon  = false,
+        Common    = false,
     },
-    MutationOnly      = false,       -- catch only mutated pets
-    MaxCatchPerMin    = 30,          -- anti-detection cap
-    HumanMode         = false,       -- randomized action delays
+
+    MinRarity         = 0,          -- minimum tier floor (0 = All)
+    MutationOnly      = false,
+    MaxCatchPerMin    = 30,
+    HumanMode         = false,
 
     -- Blacklist / Whitelist
-    Blacklist         = {},          -- pet names to skip
-    Whitelist         = {},          -- pet names to always catch (overrides rarity filter)
+    Blacklist         = {},
+    Whitelist         = {},
 
     -- Economy
     AutoCollect       = false,
@@ -238,32 +275,34 @@ local CFG = {
     AutoFeedPets      = false,
     FeedInterval      = 60,
     AutoSellPets      = false,
-    SellBelowRarity   = "Uncommon",  -- sell pets below this rarity
+    SellBelowRarity   = "Uncommon",
     AutoSellEggs      = false,
-    SellEggThreshold  = 5,           -- sell if same egg type > this count
+    SellEggThreshold  = 5,
 
     -- Eggs & Breeding
     AutoHatch         = false,
     HatchInterval     = 10,
     AutoBreed         = false,
     BreedDelay        = 5.0,
-    SmartBreed        = false,       -- scan pen for valid recipe pairs
-    BreedRarityMatch  = false,       -- pair same-rarity pets
+    RecipeBreed       = false,      -- v3: use BREED_RECIPES table
+    SmartBreed        = false,      -- pair same-name pets first
+    BreedRarityMatch  = false,      -- pair same-rarity pets
 
     -- Events & Weather
-    AutoTotem         = false,       -- use totem when target weather not active
+    AutoTotem         = false,
     TargetWeather     = "Thunderstorm",
-    AutoFruitCollect  = false,       -- teleport to and grab fruits
+    AutoFruitCollect  = false,
     FruitTypes        = {"Volcanic", "Cosmic"},
-    SkeletonAlert     = false,       -- notify when skeleton event is near
+    SkeletonAlert     = false,
+    FruitHoldBypass   = true,       -- v3: zero HoldDuration before fireproximityprompt
 
     -- ESP
     ESPEnabled        = false,
     ESPColor          = Color3.fromRGB(255, 80, 80),
-    ESPRarityColors   = true,        -- override with per-rarity color
+    ESPRarityColors   = true,
     HighlightNearest  = false,
     ShowMutationBadge = true,
-    ESPMutationOnly   = false,       -- show only mutated pets in ESP
+    ESPMutationOnly   = false,
 
     -- Utility
     WalkSpeed         = 16,
@@ -283,67 +322,74 @@ local CFG = {
 
 local ST = {
     Running       = true,
-
-    -- Connections (named dictionary)
     Connections   = {},
-
-    -- ESP
     ESPObjects    = {},
 
-    -- Pet registry: model -> { tier, mutation, name }
+    -- Pet registry: model -> { tier, mutation, name, anchor }
     PetRegistry   = {},
 
-    -- Remote signature map (built by namecall hook)
+    -- v3: Pen pet cache (ChildAdded-driven, avoids GetDescendants in feed loop)
+    PenPets       = {},
+
+    -- Remote signature map (namecall hook)
     RemoteSigs    = {},
 
-    -- Remote last-fire timestamps for cooldown enforcement
+    -- Remote last-fire timestamps (cooldown enforcement)
     RemoteLastFire = {},
 
+    -- v3: Ring buffer for remote call log (last 50)
+    RemoteLog     = {},
+    RemoteLogMax  = 50,
+    RemoteLogIdx  = 0,
+
     -- Minigame
-    MinigameSig   = nil,
+    MinigameSig          = nil,
     MinigameSigValidated = false,
 
     -- Hook
-    HookActive    = false,
-    OldNamecall   = nil,
+    HookActive  = false,
+    OldNamecall = nil,
 
-    -- Status labels (set after GUI builds)
-    StatusLabels  = {},
+    -- Status labels (assigned after GUI builds)
+    StatusLabels = {},
 
     -- Session stats
     Stats = {
-        CatchAttempts = 0,
+        CatchAttempts  = 0,
         CatchConfirmed = 0,
-        SessionStart  = tick(),
-        LastBestPet   = "None",
-        LastBestTier  = 0,
-        IncomeLog     = {},    -- {time, amount} for income/sec calc
+        SessionStart   = tick(),
+        LastBestPet    = "None",
+        LastBestTier   = 0,
     },
 
     -- Weather
     Weather = {
-        Current   = "Unknown",
+        Current  = "Unknown",
         StartTime = 0,
-        Duration  = 600,    -- seconds, default assumption
-        EventActive = false,
+        Duration  = 600,
     },
 
-    -- Skeleton event
+    -- Skeleton
     Skeleton = {
-        LastSeen   = 0,
-        NextEst    = 0,
-        IsActive   = false,
+        LastSeen = 0,
+        IsActive = false,
     },
 
-    -- Fruit tracking
+    -- Fruit cache
     FruitRegistry = {},
 
-    -- Nearest pet cache
+    -- Nearest pet model ref (for GUI watcher)
     NearestPet = nil,
 
-    -- Catches this minute (anti-detection)
-    CatchesThisMin  = 0,
-    CatchMinReset   = tick(),
+    -- Anti-detection rate limiter
+    CatchesThisMin = 0,
+    CatchMinReset  = tick(),
+
+    -- v3: Worker pool semaphore counter for TameAll
+    TamePoolActive = 0,
+
+    -- v3: Debounce timers for config save
+    SaveDebounceTime = 0,
 
     -- Rayfield ref
     RayfieldReady = false,
@@ -351,7 +397,7 @@ local ST = {
 }
 
 -- ============================================================
--- S8  REMOTE CACHE (lazy + DescendantAdded watcher)
+-- S8  REMOTE CACHE
 -- ============================================================
 
 local REM = {}
@@ -367,8 +413,7 @@ local WANTED_REMOTES = {
     "extendFence", "getFenceStats",
     "ClaimFeepEgg", "CancelMinigame",
     "GetActiveWeather", "GetWeatherList",
-    "RequestEggNurseryPlacement",
-    "RequestEggNurseryRetrieval",
+    "RequestEggNurseryPlacement", "RequestEggNurseryRetrieval",
     "BuyLasso", "EquipLasso", "equipLassoVisual",
     "AttemptUpgradeFarm", "AttemptSwapPet",
     "GetFarmLevel", "GetPetInventoryData",
@@ -383,12 +428,10 @@ local WANTED_REMOTES = {
     "RequestSetOffer", "RequestAccept", "RequestUnaccept",
     "BuyMerchant", "RequestMerchant",
     "updateHotbarSlots", "ClientReady",
-    -- weather / events
-    "RequestWeather", "GetWeatherState", "RequestTotem",
+    "RequestWeather", "RequestTotem",
     "CollectFruit", "PickupFruit",
-    -- sell (scanner confirmed: only sellPet + sellEgg exist)
-    -- breed
     "BreedPets", "GetBreedRecipes",
+    "MutateMachine",
 }
 
 local WANTED_SET = {}
@@ -404,17 +447,12 @@ local function TryCacheObject(obj)
 end
 
 local function CacheRemotes()
-    for _, obj in ipairs(game:GetDescendants()) do
-        TryCacheObject(obj)
-    end
-    for _, obj in ipairs(getnilinstances()) do
-        TryCacheObject(obj)
-    end
+    for _, obj in ipairs(game:GetDescendants()) do TryCacheObject(obj) end
+    for _, obj in ipairs(getnilinstances())       do TryCacheObject(obj) end
 end
 
 CacheRemotes()
 
--- Watcher: cache remotes as they appear after ClientReady
 ST.Connections.RemoteWatcher = game.DescendantAdded:Connect(function(obj)
     task.defer(function() TryCacheObject(obj) end)
 end)
@@ -423,59 +461,82 @@ end)
 -- S9  UTILITY FUNCTIONS
 -- ============================================================
 
--- Jitter: returns delay with optional human-mode randomness
+-- Debounce factory: returns a function that only fires fn after `wait` seconds
+-- of silence. Subsequent calls within the window reset the timer.
+local function Debounce(fn, wait)
+    local timer = nil
+    return function(...)
+        local args = {...}
+        if timer then task.cancel(timer) end
+        timer = task.delay(wait, function()
+            timer = nil
+            fn(table.unpack(args))
+        end)
+    end
+end
+
+-- Jitter: returns a base delay + random fraction, scaled by Human Mode
 local function Jitter(base, factor)
     factor = factor or 0.15
     local j = base * factor * math.random()
-    if CFG.HumanMode then
-        j = j + 0.5 + math.random() * 1.5
-    end
+    if CFG.HumanMode then j = j + 0.3 + math.random() * 0.8 end
     return base + j
+end
+
+-- Human action delay: simulate button-press latency
+local function HumanWait()
+    if CFG.HumanMode then task.wait(0.25 + math.random() * 0.5) end
 end
 
 -- Per-remote cooldown gate
 local function CanFire(remoteName)
     local cd = REMOTE_COOLDOWNS[remoteName]
     if not cd then return true end
-    local last = ST.RemoteLastFire[remoteName] or 0
-    return (tick() - last) >= cd
+    return (tick() - (ST.RemoteLastFire[remoteName] or 0)) >= cd
 end
 
 local function MarkFired(remoteName)
     ST.RemoteLastFire[remoteName] = tick()
 end
 
--- Safe fire with cooldown and vararg packing
+-- v3: Append entry to ring buffer RemoteLog
+local function LogRemote(name, method, args)
+    ST.RemoteLogIdx = (ST.RemoteLogIdx % ST.RemoteLogMax) + 1
+    ST.RemoteLog[ST.RemoteLogIdx] = {
+        time   = tick(),
+        name   = name,
+        method = method,
+        args   = args,
+    }
+end
+
+-- Safe RemoteEvent fire with cooldown + ring buffer logging
 local function SafeFire(remote, ...)
     local args = {...}
     if not remote then return false end
     if not CanFire(remote.Name) then return false end
     MarkFired(remote.Name)
-    local ok = pcall(function()
-        remote:FireServer(table.unpack(args))
-    end)
+    LogRemote(remote.Name, "FireServer", args)
+    local ok = pcall(function() remote:FireServer(table.unpack(args)) end)
     return ok
 end
 
+-- Safe RemoteFunction invoke with cooldown + ring buffer logging
 local function SafeInvoke(remote, ...)
     local args = {...}
     if not remote then return nil end
     if not CanFire(remote.Name) then return nil end
     MarkFired(remote.Name)
-    local ok, result = pcall(function()
-        return remote:InvokeServer(table.unpack(args))
-    end)
+    LogRemote(remote.Name, "InvokeServer", args)
+    local ok, result = pcall(function() return remote:InvokeServer(table.unpack(args)) end)
     return ok and result or nil
 end
 
+-- Dispatch to correct method based on remote type
 local function SafeCall(remote, ...)
-    local args = {...}
     if not remote then return nil end
-    if remote:IsA("RemoteFunction") then
-        return SafeInvoke(remote, table.unpack(args))
-    else
-        return SafeFire(remote, table.unpack(args))
-    end
+    if remote:IsA("RemoteFunction") then return SafeInvoke(remote, ...) end
+    return SafeFire(remote, ...)
 end
 
 local function GetDistance(a, b)
@@ -483,25 +544,17 @@ local function GetDistance(a, b)
     return (a - b).Magnitude
 end
 
--- Lateral approach: 6 studs behind the target, not inside it
+-- Lateral approach: position the player behind the target (not inside it)
 local function LateralApproachCFrame(targetPos)
     local root = GetRoot()
     if not root then
-        return CFrame.new(targetPos + Vector3.new(0, 3, 6))
+        return CFrame.new(targetPos + Vector3.new(0, 3, LATERAL_OFFSET_STUDS))
     end
     local dir = (root.Position - targetPos)
-    if dir.Magnitude < 0.1 then
-        dir = Vector3.new(0, 0, 1)
-    end
+    if dir.Magnitude < 0.1 then dir = Vector3.new(0, 0, 1) end
     dir = dir.Unit
-    local approach = targetPos + dir * 6 + Vector3.new(0, 3, 0)
+    local approach = targetPos + dir * LATERAL_OFFSET_STUDS + Vector3.new(0, 3, 0)
     return CFrame.new(approach, targetPos + Vector3.new(0, 1.5, 0))
-end
-
-local function TeleportTo(position, offset)
-    local root = GetRoot()
-    if not root then return end
-    root.CFrame = CFrame.new(position + (offset or Vector3.new(0, 3, 0)))
 end
 
 local function TeleportLateral(targetPos)
@@ -510,26 +563,21 @@ local function TeleportLateral(targetPos)
     root.CFrame = LateralApproachCFrame(targetPos)
 end
 
--- Returns tier integer for a rarity string, 0 if unknown
+-- Tier integer from a rarity string
 local function GetTierFromString(rarityStr)
     if not rarityStr then return 0 end
     for keyword, tier in pairs(RARITY_TIERS) do
-        if rarityStr:lower():find(keyword:lower()) then
-            return tier
-        end
+        if rarityStr:lower():find(keyword:lower()) then return tier end
     end
     return 0
 end
 
 -- Extract rarity tier from a pet model
 local function GetPetTier(model)
-    -- Check attributes
     local attr = model:GetAttribute("Rarity")
             or model:GetAttribute("rarity")
             or model:GetAttribute("PetRarity")
     if attr then return GetTierFromString(tostring(attr)) end
-
-    -- Check StringValues
     for _, child in ipairs(model:GetDescendants()) do
         if child:IsA("StringValue") then
             local n = child.Name:lower()
@@ -538,22 +586,17 @@ local function GetPetTier(model)
             end
         end
     end
-
-    -- Infer from model name
     return GetTierFromString(model.Name)
 end
 
--- Extract mutation from a pet model, returns string or nil
+-- Extract mutation from a pet model (returns string or nil)
 local function GetPetMutation(model)
-    -- Check attribute
     local attr = model:GetAttribute("Mutation")
             or model:GetAttribute("mutation")
             or model:GetAttribute("Trait")
     if attr and tostring(attr) ~= "" and tostring(attr) ~= "None" then
         return tostring(attr)
     end
-
-    -- Check StringValues
     for _, child in ipairs(model:GetDescendants()) do
         if child:IsA("StringValue") then
             local n = child.Name:lower()
@@ -564,18 +607,34 @@ local function GetPetMutation(model)
             end
         end
     end
-
-    -- Infer from model name
     for _, kw in ipairs(MUTATION_KEYWORDS) do
-        if model.Name:find(kw) then
-            return kw
-        end
+        if model.Name:find(kw) then return kw end
     end
-
     return nil
 end
 
--- Is pet name in blacklist?
+-- v3: NormalizePetData() -- canonical form for any inventory entry.
+-- Handles all known server formats so features never need to guess field names.
+local function NormalizePetData(raw)
+    if type(raw) ~= "table" then return nil end
+    local id   = raw.id   or raw.Id   or raw.petId or raw.PetId
+                 or raw.uuid or raw.UUID or raw.petUUID
+    local name = raw.name or raw.Name or raw.petName or raw.PetName
+                 or raw.animal or raw.type or ""
+    local rar  = raw.rarity or raw.Rarity or raw.tier or raw.Tier or ""
+    local mut  = raw.mutation or raw.Mutation or raw.trait or raw.Trait or ""
+    local tier = GetTierFromString(tostring(rar))
+    if id == nil and name == "" then return nil end
+    return {
+        id       = id,
+        name     = tostring(name),
+        rarity   = tostring(rar),
+        tier     = tier,
+        mutation = (mut ~= "" and mut ~= "None") and tostring(mut) or nil,
+        _raw     = raw,  -- preserve original for remote fires
+    }
+end
+
 local function IsBlacklisted(name)
     for _, n in ipairs(CFG.Blacklist) do
         if n:lower() == name:lower() then return true end
@@ -583,7 +642,6 @@ local function IsBlacklisted(name)
     return false
 end
 
--- Is pet name in whitelist?
 local function IsWhitelisted(name)
     for _, n in ipairs(CFG.Whitelist) do
         if n:lower() == name:lower() then return true end
@@ -591,21 +649,12 @@ local function IsWhitelisted(name)
     return false
 end
 
--- Format seconds as mm:ss
 local function FormatTime(secs)
     secs = math.max(0, math.floor(secs))
     return string.format("%d:%02d", math.floor(secs / 60), secs % 60)
 end
 
--- Format a rate per-hour from a per-second rate
-local function FormatRate(perSec)
-    if perSec < 1 then
-        return string.format("%.1f/min", perSec * 60)
-    end
-    return string.format("%.1f/hr", perSec * 3600)
-end
-
--- Resilient label updater
+-- Resilient label updater (handles all Rayfield label API variants)
 local function UpdateLabel(label, text, icon)
     if not label then return end
     for _, m in ipairs({"Set", "Update", "Refresh"}) do
@@ -616,7 +665,7 @@ local function UpdateLabel(label, text, icon)
     pcall(function() label.Text = text end)
 end
 
--- Notify helper (queues if Rayfield not ready)
+-- Notify helper with queue support (safe before Rayfield is ready)
 local function Notify(title, content, duration, icon)
     local payload = {
         Title    = tostring(title),
@@ -631,7 +680,19 @@ local function Notify(title, content, duration, icon)
     end
 end
 
--- Get current inventory count (for catch confirmation)
+-- Config auto-save (debounced 2s so slider drags don't hammer storage)
+local SaveConfigDebounced = Debounce(function()
+    if IS_XENO and Xeno and Xeno.SetGlobal then
+        pcall(function() Xeno.SetGlobal("CATConfig_v300", CFG) end)
+    end
+end, 2)
+
+-- Shorthand: call SaveConfigDebounced every time a toggle/slider fires
+local function OnConfigChange()
+    SaveConfigDebounced()
+end
+
+-- Inventory count (used for catch confirmation via delta)
 local function GetInventoryCount()
     local inv = SafeInvoke(REM.getPetInventory)
     if type(inv) ~= "table" then return 0 end
@@ -641,7 +702,7 @@ local function GetInventoryCount()
 end
 
 -- ============================================================
--- S10  PET REGISTRY (event-driven, with rarity + mutation)
+-- S10  PET REGISTRY (event-driven)
 -- ============================================================
 
 local function BuildPetEntry(model)
@@ -649,7 +710,6 @@ local function BuildPetEntry(model)
                or model:FindFirstChild("HumanoidRootPart")
                or model:FindFirstChild("PrimaryPart")
     if not anchor then return nil end
-
     return {
         model    = model,
         anchor   = anchor,
@@ -665,7 +725,6 @@ local function RegisterPet(model)
     local entry = BuildPetEntry(model)
     if not entry then return end
     ST.PetRegistry[model] = entry
-
     if CFG.ESPEnabled then
         task.defer(function()
             if _G.CAT_CreateESP then _G.CAT_CreateESP(model) end
@@ -688,12 +747,38 @@ end
 
 local PetContainer = Workspace:WaitForChild("RoamingPets", 15)
 local PetsFolder   = PetContainer and PetContainer:WaitForChild("Pets", 15)
-local FruitsFolder = nil
+
+-- v3: Pen pet cache (ChildAdded/ChildRemoved instead of GetDescendants in feed loop)
+local PenFolder = nil
 pcall(function()
-    FruitsFolder = Workspace:WaitForChild("Fruits", 5)
-            or Workspace:WaitForChild("WorldItems", 5)
+    PenFolder = Workspace:FindFirstChild("Pens")
+             or Workspace:FindFirstChild("PlayerPens")
+             or Workspace:WaitForChild("Pens", 5)
 end)
 
+local function RegisterPenPet(model)
+    if model and model:IsA("Model") then
+        ST.PenPets[model] = true
+    end
+end
+
+local function UnregisterPenPet(model)
+    ST.PenPets[model] = nil
+end
+
+if PenFolder then
+    for _, m in ipairs(PenFolder:GetDescendants()) do
+        if m:IsA("Model") then RegisterPenPet(m) end
+    end
+    ST.Connections.PenAdded = PenFolder.DescendantAdded:Connect(function(obj)
+        if obj:IsA("Model") then RegisterPenPet(obj) end
+    end)
+    ST.Connections.PenRemoved = PenFolder.DescendantRemoving:Connect(function(obj)
+        if obj:IsA("Model") then UnregisterPenPet(obj) end
+    end)
+end
+
+-- Roaming pet watchers
 if PetsFolder then
     for _, m in ipairs(PetsFolder:GetChildren()) do RegisterPet(m) end
     ST.Connections.PetAdded = PetsFolder.ChildAdded:Connect(function(child)
@@ -705,50 +790,55 @@ if PetsFolder then
     end)
 end
 
+local FruitsFolder = nil
+pcall(function()
+    FruitsFolder = Workspace:WaitForChild("Fruits", 3)
+            or Workspace:WaitForChild("WorldItems", 3)
+end)
+
 -- ============================================================
--- S11  NAMECALL HOOK (captures ALL remote signatures)
+-- S11  NAMECALL HOOK
 -- ============================================================
 
 local function InstallHook()
     if ST.HookActive then return end
-    if not hookmetamethod then return end
-    if not getrawmetatable then return end
-
+    if not hookmetamethod or not getrawmetatable then return end
     local mt = getrawmetatable(game)
     if not mt then return end
-
     local originalNC
     local ok, val = pcall(rawget, mt, "__namecall")
-    if ok and typeof(val) == "function" then
-        originalNC = val
-    end
+    if ok and typeof(val) == "function" then originalNC = val end
 
     local candidate = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
         local args   = {...}
         local method = (getnamecallmethod and getnamecallmethod()) or ""
 
-        -- Capture minigame signature
-        if method == "InvokeServer"
-        and (self == REM.minigameRequest or self == REM.UpdateProgress)
-        and not checkcaller()
-        and not ST.MinigameSigValidated then
-            ST.MinigameSig = args
-            -- Validated flag set after we confirm a catch works
+        -- Fast path: skip everything that isn't a remote call
+        if method ~= "FireServer" and method ~= "InvokeServer" then
+            local passNC = ST.OldNamecall or originalNC
+            if passNC then return passNC(self, ...) end
+            return
         end
 
-        -- Passive signature map for all remotes
-        if (method == "FireServer" or method == "InvokeServer")
-        and not checkcaller() then
-            local rname = pcall(function() return self.Name end) and self.Name or nil
-            if rname and WANTED_SET[rname] and not ST.RemoteSigs[rname] then
-                ST.RemoteSigs[rname] = args
+        if not checkcaller() then
+            -- Capture minigame signature from game's own calls
+            if (self == REM.minigameRequest or self == REM.UpdateProgress)
+            and not ST.MinigameSigValidated then
+                ST.MinigameSig = args
+            end
+
+            -- Build passive signature map
+            local rname = nil
+            pcall(function() rname = self.Name end)
+            if rname and WANTED_SET[rname] then
+                if not ST.RemoteSigs[rname] then
+                    ST.RemoteSigs[rname] = args
+                end
             end
         end
 
-        local passthrough = ST.OldNamecall or originalNC
-        if passthrough then
-            return passthrough(self, table.unpack(args))
-        end
+        local passNC = ST.OldNamecall or originalNC
+        if passNC then return passNC(self, ...) end
     end))
 
     ST.OldNamecall = candidate or originalNC
@@ -760,30 +850,21 @@ end
 -- ============================================================
 
 local function DetectWeather()
-    -- Try attribute on Workspace or a dedicated WeatherModule
     local attr = Workspace:GetAttribute("Weather")
             or Workspace:GetAttribute("CurrentWeather")
             or Workspace:GetAttribute("WeatherState")
-    if attr then
-        ST.Weather.Current = tostring(attr)
-        return
-    end
+    if attr then ST.Weather.Current = tostring(attr); return end
 
-    -- Try a value object commonly named WeatherState or CurrentWeather
     local vo = Workspace:FindFirstChild("WeatherState")
            or Workspace:FindFirstChild("CurrentWeather")
            or ReplicatedStorage:FindFirstChild("WeatherState")
     if vo and (vo:IsA("StringValue") or vo:IsA("IntValue")) then
-        ST.Weather.Current = tostring(vo.Value)
-        return
+        ST.Weather.Current = tostring(vo.Value); return
     end
 
-    -- GetActiveWeather is the confirmed remote (scanner-verified)
     local weatherResult = SafeInvoke(REM.GetActiveWeather)
-                       or SafeInvoke(REM.GetWeatherState)
     if type(weatherResult) == "string" then
-        ST.Weather.Current = weatherResult
-        return
+        ST.Weather.Current = weatherResult; return
     end
     if type(weatherResult) == "table" then
         ST.Weather.Current = weatherResult.weather
@@ -791,7 +872,6 @@ local function DetectWeather()
                           or weatherResult.current
                           or (type(weatherResult[1]) == "string" and weatherResult[1])
                           or "Unknown"
-        return
     end
 end
 
@@ -809,38 +889,43 @@ local function UseWeatherTotem()
 end
 
 -- ============================================================
--- S13  PRIORITY CATCH LOGIC
+-- S13  PRIORITY CATCH LOGIC (v3: multi-rarity select)
 -- ============================================================
 
--- Returns the priority tier of a rarity filter string
-local function FilterTier()
-    return RARITY_TIERS[CFG.RarityFilter] or 0
+-- Returns true if any HuntRarities flag is set to true
+local function HuntRaritiesActive()
+    for _, v in pairs(CFG.HuntRarities) do
+        if v then return true end
+    end
+    return false
 end
 
--- Score a pet entry: returns a sort score (higher = higher priority)
+-- Score a pet entry for catch priority.
+-- v3: when HuntRarities has any selection, only those tiers are eligible.
+-- Returns -1 to skip, 0+ to catch (higher = higher priority).
 local function ScorePetEntry(entry)
     if not entry then return -1 end
-
-    -- Blacklist check
     if IsBlacklisted(entry.name) then return -1 end
-
-    -- Mutation-only filter
     if CFG.MutationOnly and not entry.mutation then return -1 end
 
-    -- Whitelist overrides rarity filter but not blacklist
+    -- Whitelist overrides all rarity filters
     if IsWhitelisted(entry.name) then return 1000 + entry.tier end
 
-    -- Rarity filter gate
-    if entry.tier < FilterTier() then return -1 end
+    -- v3: Multi-rarity select mode
+    if HuntRaritiesActive() then
+        local tierName = TIER_NAMES[entry.tier]
+        if not tierName or not CFG.HuntRarities[tierName] then return -1 end
+    else
+        -- Classic floor mode
+        if entry.tier < CFG.MinRarity then return -1 end
+    end
 
-    -- Priority score = tier * 100 + mutation bonus
     local score = entry.tier * 100
     if entry.mutation then score = score + 50 end
-
     return score
 end
 
--- Finds the highest-priority pet in range
+-- Find highest-priority pet in registry; prune stale entries as a side effect
 local function FindBestPet()
     local root = GetRoot()
     if not root then return nil, math.huge end
@@ -855,7 +940,6 @@ local function FindBestPet()
                 local score = ScorePetEntry(entry)
                 if score >= 0 then
                     local d = GetDistance(root.Position, anchor.Position)
-                    -- Compare by score first, then distance as tiebreak
                     if score > bestScore
                     or (score == bestScore and d < bestDist) then
                         bestEntry = entry
@@ -870,34 +954,29 @@ local function FindBestPet()
     end
 
     for _, m in ipairs(stale) do ST.PetRegistry[m] = nil end
-
     return bestEntry, bestDist
 end
 
 -- ============================================================
--- S14  FRUIT COLLECTION
+-- S14  FRUIT COLLECTION (v3: hold-timer bypass)
 -- ============================================================
 
 local function ScanFruits()
     ST.FruitRegistry = {}
     local scanTargets = {Workspace}
     if FruitsFolder then table.insert(scanTargets, FruitsFolder) end
-
     for _, container in ipairs(scanTargets) do
         for _, obj in ipairs(container:GetDescendants()) do
             local isFruit = false
             for _, ft in ipairs(CFG.FruitTypes) do
-                if obj.Name:find(ft) then
-                    isFruit = true
-                    break
-                end
+                if obj.Name:find(ft) then isFruit = true; break end
             end
             if isFruit and (obj:IsA("Model") or obj:IsA("Part") or obj:IsA("MeshPart")) then
                 local pos = obj:IsA("Model")
                     and (obj.PrimaryPart or obj:FindFirstChild("Handle") or obj:FindFirstChild("Root"))
                     or obj
                 if pos then
-                    table.insert(ST.FruitRegistry, { obj = obj, part = pos })
+                    table.insert(ST.FruitRegistry, {obj = obj, part = pos})
                 end
             end
         end
@@ -917,34 +996,37 @@ local function CollectFruits()
             local pos = entry.part:IsA("BasePart")
                 and entry.part.Position
                 or entry.part.CFrame.Position
+
             TeleportLateral(pos)
             task.wait(0.1)
 
-            -- Try remote first
+            -- Remote path
             if REM.CollectFruit then
                 SafeCall(REM.CollectFruit, entry.obj)
-                task.wait(0.2)
+                task.wait(0.15)
             elseif REM.PickupFruit then
                 SafeCall(REM.PickupFruit, entry.obj)
-                task.wait(0.2)
+                task.wait(0.15)
             end
 
-            -- Try ClickDetector
+            -- ClickDetector path
             local click = entry.obj:FindFirstChildWhichIsA("ClickDetector", true)
-            if click then
-                pcall(fireclickdetector, click)
-                task.wait(0.1)
-            end
+            if click then pcall(fireclickdetector, click); task.wait(0.08) end
 
-            -- Try ProximityPrompt
+            -- v3: ProximityPrompt with hold-timer bypass.
+            -- Set HoldDuration = 0 on the client before firing to skip the
+            -- server's wait requirement (Konglomerate-style bypass).
             local prompt = entry.obj:FindFirstChildWhichIsA("ProximityPrompt", true)
             if prompt then
+                if CFG.FruitHoldBypass then
+                    pcall(function() prompt.HoldDuration = 0 end)
+                end
                 pcall(fireproximityprompt, prompt)
-                task.wait(0.1)
+                task.wait(0.08)
             end
 
             collected = collected + 1
-            task.wait(Jitter(0.3))
+            task.wait(Jitter(0.25))
         end
     end
 
@@ -954,26 +1036,24 @@ local function CollectFruits()
 end
 
 -- ============================================================
--- S14-B  TAME ALL PETS
+-- S14-B  TAME ALL PETS (v3: worker pool semaphore)
 -- ============================================================
--- Fires the full tame sequence (ThrowLasso -> minigameRequest ->
--- RequestPlacePet) at every pet currently in the registry.
--- Each pet gets its own task.spawn so all tames run concurrently.
--- TameAllStagger staggers thread launch to avoid a wall of
--- simultaneous remote fires that could trigger rate-limit detection.
--- Returns the number of tame sequences dispatched.
+-- TameAll now uses a bounded semaphore (TAME_POOL_MAX concurrent goroutines).
+-- Each worker acquires the semaphore before launching and releases it when done,
+-- keeping the remote fire rate predictable and avoiding server-side pattern flags.
 
 local function TameSinglePet(entry)
-    if not entry or not entry.model or not entry.model.Parent then return false end
+    if not entry or not entry.model or not entry.model.Parent then
+        ST.TamePoolActive = math.max(0, ST.TamePoolActive - 1)
+        return false
+    end
     local anchor = entry.anchor
-    if not anchor or not anchor.Parent then return false end
+    if not anchor or not anchor.Parent then
+        ST.TamePoolActive = math.max(0, ST.TamePoolActive - 1)
+        return false
+    end
 
-    -- Override per-remote cooldown tracking for this pet specifically
-    -- so concurrent threads don't block each other
-    local remoteCD = REMOTE_COOLDOWNS.minigameRequest or 0.5
-
-    -- Throw lasso (no teleport -- server validates position server-side
-    -- when ThrowLasso is fired directly with the target's position)
+    -- Throw lasso at pet with its server-side position
     pcall(function()
         if REM.ThrowLasso then
             REM.ThrowLasso:FireServer(entry.model, anchor.Position)
@@ -981,11 +1061,7 @@ local function TameSinglePet(entry)
     end)
     task.wait(0.2)
 
-    -- Solve minigame: fire UpdateProgress(100) as primary.
-    -- GUI watcher runs as backup for any UI elements that may still appear.
-    task.spawn(function()
-        WatchAndClickMinigameGUI(2.0)
-    end)
+    -- Solve minigame: UpdateProgress(100) is the confirmed primary remote
     pcall(function()
         if REM.UpdateProgress then
             REM.UpdateProgress:FireServer(100)
@@ -993,32 +1069,29 @@ local function TameSinglePet(entry)
             REM.minigameRequest:InvokeServer(true)
         end
     end)
-
     task.wait(0.15)
 
     -- Place pet in pen if enabled
     if CFG.AutoPlacePet then
         pcall(function()
-            if REM.RequestPlacePet then
-                REM.RequestPlacePet:FireServer()
-            end
+            if REM.RequestPlacePet then REM.RequestPlacePet:FireServer() end
         end)
     end
 
+    -- Release pool slot
+    ST.TamePoolActive = math.max(0, ST.TamePoolActive - 1)
     return true
 end
 
-local TameAllActive = false  -- guard against overlapping runs
+local TameAllActive = false
 
 local function TameAllPets()
     if TameAllActive then return 0 end
     TameAllActive = true
 
-    -- Snapshot registry now (pairs iterator is not safe across yields)
     local snapshot = {}
     for model, entry in pairs(ST.PetRegistry) do
         if model and model.Parent and entry.anchor and entry.anchor.Parent then
-            -- Apply same rarity/blacklist/whitelist filters as normal farm
             if ScorePetEntry(entry) >= 0 then
                 table.insert(snapshot, entry)
             end
@@ -1035,19 +1108,25 @@ local function TameAllPets()
     local startTime  = tick()
 
     for i, entry in ipairs(snapshot) do
-        -- Stagger: launch each thread TameAllStagger seconds apart
+        -- Stagger thread launch
         if i > 1 and CFG.TameAllStagger > 0 then
             task.wait(CFG.TameAllStagger)
         end
 
-        -- Don't keep running if the registry pet despawned during stagger
+        -- Wait for a pool slot to become available
+        local waited = 0
+        while ST.TamePoolActive >= TAME_POOL_MAX and waited < 5 do
+            task.wait(0.1)
+            waited = waited + 0.1
+        end
+
         if entry.model and entry.model.Parent then
+            ST.TamePoolActive = ST.TamePoolActive + 1
             task.spawn(TameSinglePet, entry)
             dispatched = dispatched + 1
         end
     end
 
-    -- Brief wait for threads to finish before allowing next run
     task.wait(math.max(0.5, CFG.TameAllStagger * #snapshot + 0.5))
     TameAllActive = false
 
@@ -1069,19 +1148,12 @@ local function SellPets()
     local threshold = RARITY_TIERS[CFG.SellBelowRarity] or 2
     local sold = 0
 
-    for _, petData in pairs(inventory) do
-        if type(petData) == "table" then
-            -- Try to determine rarity from petData fields
-            local rarStr = petData.rarity or petData.Rarity
-                        or petData.tier   or petData.Tier or ""
-            local tier = GetTierFromString(tostring(rarStr))
-
-            if tier < threshold and tier > 0 then
-                -- sellPet is a RemoteFunction (scanner confirmed). SellPets does not exist.
-                SafeInvoke(REM.sellPet, petData)
-                sold = sold + 1
-                task.wait(Jitter(0.25))
-            end
+    for _, petRaw in pairs(inventory) do
+        local petData = NormalizePetData(petRaw)
+        if petData and petData.tier < threshold and petData.tier > 0 then
+            SafeInvoke(REM.sellPet, petData._raw)
+            sold = sold + 1
+            task.wait(Jitter(0.22))
         end
     end
 
@@ -1091,7 +1163,6 @@ local function SellPets()
 end
 
 local function SellEggs()
-    -- sellEgg is a RemoteFunction; getEggInventory gets the list first
     local inventory = SafeInvoke(REM.getEggInventory)
     if type(inventory) ~= "table" then
         SafeInvoke(REM.sellEgg)
@@ -1103,7 +1174,7 @@ local function SellEggs()
         if type(eggData) == "table" then
             SafeInvoke(REM.sellEgg, eggData)
             sold = sold + 1
-            task.wait(Jitter(0.15))
+            task.wait(Jitter(0.12))
         end
     end
     if sold > 0 then
@@ -1112,8 +1183,15 @@ local function SellEggs()
 end
 
 -- ============================================================
--- S16  SMART BREED
+-- S16  SMART BREED (v3: recipe-aware)
 -- ============================================================
+
+-- Build recipe key from two pet names (sorted so order doesn't matter)
+local function RecipeKey(nameA, nameB)
+    local a, b = tostring(nameA), tostring(nameB)
+    if a > b then a, b = b, a end
+    return a .. "|" .. b
+end
 
 local function SmartBreedCycle()
     local inventory = SafeInvoke(REM.getPetInventory)
@@ -1122,85 +1200,104 @@ local function SmartBreedCycle()
         return
     end
 
-    if CFG.BreedRarityMatch then
-        -- Build rarity buckets
-        local buckets = {}
-        for _, petData in pairs(inventory) do
-            if type(petData) == "table" then
-                local rarStr = petData.rarity or petData.Rarity or ""
-                local tier = GetTierFromString(tostring(rarStr))
-                if tier > 0 then
-                    if not buckets[tier] then buckets[tier] = {} end
-                    table.insert(buckets[tier], petData)
+    -- Normalize all entries
+    local pets = {}
+    for _, raw in pairs(inventory) do
+        local p = NormalizePetData(raw)
+        if p then table.insert(pets, p) end
+    end
+
+    -- v3: Recipe Auto Breed -- scan for known recipe pairs first
+    if CFG.RecipeBreed then
+        local usedIndices = {}
+        for i = 1, #pets do
+            if not usedIndices[i] then
+                for j = i + 1, #pets do
+                    if not usedIndices[j] then
+                        local key = RecipeKey(pets[i].name, pets[j].name)
+                        if BREED_RECIPES[key] then
+                            SafeInvoke(REM.breedRequest, pets[i]._raw, pets[j]._raw)
+                            usedIndices[i] = true
+                            usedIndices[j] = true
+                            Notify("Breed", "Recipe: " .. BREED_RECIPES[key], 5, "git-merge")
+                            task.wait(Jitter(CFG.BreedDelay))
+                            break
+                        end
+                    end
                 end
             end
         end
+        return
+    end
 
-        -- Breed pairs within same tier
-        for tier, pets in pairs(buckets) do
-            for i = 1, #pets - 1, 2 do
-                SafeInvoke(REM.breedRequest, pets[i], pets[i + 1])
+    -- Smart Breed: pair pets with the same name (doubles)
+    if CFG.SmartBreed then
+        local byName = {}
+        for _, p in ipairs(pets) do
+            if not byName[p.name] then byName[p.name] = {} end
+            table.insert(byName[p.name], p)
+        end
+        for _, group in pairs(byName) do
+            for i = 1, #group - 1, 2 do
+                SafeInvoke(REM.breedRequest, group[i]._raw, group[i + 1]._raw)
                 task.wait(Jitter(CFG.BreedDelay))
             end
         end
-    else
-        -- Simple breed: fire request, let server decide
-        SafeInvoke(REM.breedRequest)
+        return
     end
+
+    -- Rarity Match: pair same-tier pets
+    if CFG.BreedRarityMatch then
+        local buckets = {}
+        for _, p in ipairs(pets) do
+            if p.tier > 0 then
+                if not buckets[p.tier] then buckets[p.tier] = {} end
+                table.insert(buckets[p.tier], p)
+            end
+        end
+        for _, group in pairs(buckets) do
+            for i = 1, #group - 1, 2 do
+                SafeInvoke(REM.breedRequest, group[i]._raw, group[i + 1]._raw)
+                task.wait(Jitter(CFG.BreedDelay))
+            end
+        end
+        return
+    end
+
+    -- Fallback: blind breed
+    SafeInvoke(REM.breedRequest)
 end
 
 -- ============================================================
 -- S17  MINIGAME + CORE CATCH CYCLE
 -- ============================================================
 
--- Keywords that identify the confirm/success button in the minigame GUI.
--- The watcher checks button names and text against these strings.
-local MINIGAME_BUTTON_KEYWORDS = {
-    "catch", "tame", "confirm", "success", "win",
-    "click", "press", "submit", "complete", "done",
-    "ok", "yes", "grab", "lasso", "capture",
-}
-
--- Fire every connection on a signal (MouseButton1Click / Activated).
--- Falls back to :Fire() if getconnections is unavailable.
 local function FireButtonConnections(button)
-    -- Method 1: getconnections (preferred -- calls the actual handler functions)
     local conns = getconnections(button.MouseButton1Click)
     if conns and #conns > 0 then
-        for _, conn in ipairs(conns) do
-            pcall(function() conn:Fire() end)
-        end
+        for _, conn in ipairs(conns) do pcall(function() conn:Fire() end) end
         return true
     end
-
-    -- Method 2: Activated signal
     conns = getconnections(button.Activated)
     if conns and #conns > 0 then
-        for _, conn in ipairs(conns) do
-            pcall(function() conn:Fire() end)
-        end
+        for _, conn in ipairs(conns) do pcall(function() conn:Fire() end) end
         return true
     end
-
-    -- Method 3: Direct Fire on the signal (works on some executors)
     pcall(function() button.MouseButton1Click:Fire() end)
     pcall(function() button.Activated:Fire() end)
     return false
 end
 
--- Returns true if a button name or text matches known minigame keywords.
 local function IsMinigameButton(button)
     local name = button.Name:lower()
     local text = ""
     pcall(function() text = button.Text:lower() end)
-
     for _, kw in ipairs(MINIGAME_BUTTON_KEYWORDS) do
         if name:find(kw) or text:find(kw) then return true end
     end
     return false
 end
 
--- Recursively collect all TextButton / ImageButton descendants.
 local function CollectButtons(parent, out)
     out = out or {}
     for _, child in ipairs(parent:GetDescendants()) do
@@ -1211,32 +1308,22 @@ local function CollectButtons(parent, out)
     return out
 end
 
--- Try to click any actionable element inside a GUI container.
--- Returns true if at least one click was fired.
 local function ClickGuiContents(guiObj)
     local clicked = false
-
-    -- ProximityPrompts inside the GUI (rare but possible)
     for _, prompt in ipairs(guiObj:GetDescendants()) do
         if prompt:IsA("ProximityPrompt") then
             pcall(fireproximityprompt, prompt)
             clicked = true
         end
     end
-
     local buttons = CollectButtons(guiObj)
     if #buttons == 0 then return clicked end
-
-    -- Pass 1: look for a button that matches minigame keywords
     for _, btn in ipairs(buttons) do
         if IsMinigameButton(btn) and btn.Visible then
             FireButtonConnections(btn)
             clicked = true
         end
     end
-
-    -- Pass 2: if no keyword match, click the first visible button
-    -- (the minigame may only have one button, so this is safe)
     if not clicked then
         for _, btn in ipairs(buttons) do
             if btn.Visible then
@@ -1246,20 +1333,13 @@ local function ClickGuiContents(guiObj)
             end
         end
     end
-
     return clicked
 end
 
--- Core watcher. Called after ThrowLasso fires.
--- Monitors PlayerGui (and CoreGui) for the minigame screen for up to
--- `timeout` seconds, clicks whatever it finds, and also fires the
--- minigameRequest remote in parallel so both paths are covered.
 local function WatchAndClickMinigameGUI(timeout)
     timeout = timeout or 4
     local deadline = tick() + timeout
     local clicked  = false
-
-    -- Snapshot existing GUIs so we only react to NEW ones
     local knownGUIs = {}
     local pg = Player:FindFirstChild("PlayerGui")
     if pg then
@@ -1267,164 +1347,115 @@ local function WatchAndClickMinigameGUI(timeout)
     end
     for _, g in ipairs(CoreGui:GetChildren()) do knownGUIs[g] = true end
 
-    -- Also try clicking in any GUI that already exists and looks like a minigame
-    -- (handles GUIs that were added before we started watching)
-    local function ScanExisting()
-        if pg then
-            for _, g in ipairs(pg:GetChildren()) do
-                if not knownGUIs[g] then
-                    if ClickGuiContents(g) then clicked = true end
-                end
-            end
-        end
-    end
-
-    -- Poll loop
     while tick() < deadline and not clicked do
-        -- Check PlayerGui for new ScreenGuis
         if pg then
             for _, g in ipairs(pg:GetChildren()) do
-                if not knownGUIs[g] then
-                    -- New GUI appeared -- try clicking it immediately
-                    task.wait(0.05)  -- tiny wait for GUI to finish populating
-                    if ClickGuiContents(g) then
-                        clicked = true
-                        break
-                    end
-                    knownGUIs[g] = true  -- mark so we don't retry
-                end
-            end
-        end
-
-        -- Check CoreGui for new elements
-        if not clicked then
-            for _, g in ipairs(CoreGui:GetChildren()) do
                 if not knownGUIs[g] then
                     task.wait(0.05)
-                    if ClickGuiContents(g) then
-                        clicked = true
-                        break
-                    end
+                    if ClickGuiContents(g) then clicked = true; break end
                     knownGUIs[g] = true
                 end
             end
         end
-
-        -- Also check ProximityPrompts on the pet itself each tick
-        -- (some games use a world-space prompt instead of a ScreenGui)
+        if not clicked then
+            for _, g in ipairs(CoreGui:GetChildren()) do
+                if not knownGUIs[g] then
+                    task.wait(0.05)
+                    if ClickGuiContents(g) then clicked = true; break end
+                    knownGUIs[g] = true
+                end
+            end
+        end
+        -- World-space prompts / click detectors on the pet model
         if not clicked and ST.NearestPet and ST.NearestPet.Parent then
             for _, prompt in ipairs(ST.NearestPet:GetDescendants()) do
                 if prompt:IsA("ProximityPrompt") then
                     pcall(fireproximityprompt, prompt)
-                    clicked = true
-                    break
+                    clicked = true; break
                 end
             end
-            -- ClickDetectors on the pet
             if not clicked then
                 for _, cd in ipairs(ST.NearestPet:GetDescendants()) do
                     if cd:IsA("ClickDetector") then
                         pcall(fireclickdetector, cd)
-                        clicked = true
-                        break
+                        clicked = true; break
                     end
                 end
             end
         end
-
         if not clicked then task.wait(0.08) end
     end
-
     return clicked
 end
 
--- Solves the taming minigame by firing UpdateProgress:FireServer(100).
--- Community research confirms this is the actual minigame completion remote:
---   ReplicatedStorage.Remotes.UpdateProgress:FireServer(100)
--- Passing 100 tells the server the progress bar is full -> instant catch.
--- minigameRequest is kept as a secondary fallback for future game changes.
+-- UpdateProgress:FireServer(100) is the confirmed minigame-complete remote.
+-- Community cross-reference (March 2026): cheater.fun, JumaNexus, gumanba.
+-- minigameRequest is a RemoteFunction kept only as a last-resort fallback.
 local function SolveTamingMinigame()
-    -- Primary: UpdateProgress(100) -- confirmed working across all public scripts
     if REM.UpdateProgress then
-        pcall(function()
-            REM.UpdateProgress:FireServer(100)
-        end)
+        pcall(function() REM.UpdateProgress:FireServer(100) end)
         return true
     end
-
-    -- Secondary: minigameRequest (legacy / fallback)
     if ST.MinigameSig and ST.MinigameSigValidated then
         return SafeCall(REM.minigameRequest, table.unpack(ST.MinigameSig))
     end
-
     if REM.minigameRequest then
         SafeCall(REM.minigameRequest, true)
     end
-
     return false
 end
 
-local function ThrowLassoAt(target, anchor)
-    TeleportLateral(anchor.Position)
-    task.wait(Jitter(0.15))
-    return SafeFire(REM.ThrowLasso, target, anchor.Position)
-end
-
 local function RunCatchCycle()
-    -- Anti-detection: cap catches per minute
+    -- Anti-detection rate cap
     local now = tick()
     if now - ST.CatchMinReset >= 60 then
         ST.CatchesThisMin = 0
         ST.CatchMinReset  = now
     end
-    if ST.CatchesThisMin >= CFG.MaxCatchPerMin then
-        task.wait(1)
-        return
-    end
+    if ST.CatchesThisMin >= CFG.MaxCatchPerMin then task.wait(1); return end
 
     local entry, dist = FindBestPet()
     if not entry or not entry.model or not entry.model.Parent then return end
 
     ST.NearestPet = entry.model
-
-    local anchor = entry.anchor
+    local anchor  = entry.anchor
     if not anchor or not anchor.Parent then return end
 
-    -- Snapshot inventory before catch attempt
+    -- Snapshot inventory for catch confirmation
     local invBefore = GetInventoryCount()
 
-    -- Teleport lateral (behind target)
     TeleportLateral(anchor.Position)
-    task.wait(Jitter(0.18))
+    HumanWait()
+    task.wait(Jitter(0.15))
 
     -- Throw lasso
     ST.Stats.CatchAttempts = ST.Stats.CatchAttempts + 1
-    local thrown = ThrowLassoAt(entry.model, anchor)
-    task.wait(Jitter(0.25))
-
-    -- Solve minigame via UpdateProgress:FireServer(100) (confirmed remote).
-    -- GUI watcher runs in parallel as backup for any screen UI that appears.
-    task.spawn(function()
-        WatchAndClickMinigameGUI(2.0)
+    pcall(function()
+        if REM.ThrowLasso then
+            REM.ThrowLasso:FireServer(entry.model, anchor.Position)
+        end
     end)
-    SolveTamingMinigame()
-    task.wait(Jitter(0.3))
+    task.wait(Jitter(0.22))
 
-    -- Place pet in pen
+    -- Solve minigame: primary remote + GUI watcher in parallel
+    task.spawn(function() WatchAndClickMinigameGUI(2.0) end)
+    SolveTamingMinigame()
+    task.wait(Jitter(0.28))
+
+    -- Place in pen
     if CFG.AutoPlacePet then
         SafeFire(REM.RequestPlacePet)
-        task.wait(0.15)
+        task.wait(0.12)
     end
 
-    -- Confirm catch via inventory delta
-    local invAfter = GetInventoryCount()
+    -- Confirm via inventory delta
+    local invAfter  = GetInventoryCount()
     local confirmed = invAfter > invBefore
 
     if confirmed then
         ST.Stats.CatchConfirmed = ST.Stats.CatchConfirmed + 1
-        ST.CatchesThisMin = ST.CatchesThisMin + 1
+        ST.CatchesThisMin       = ST.CatchesThisMin + 1
 
-        -- Track best pet this session
         if entry.tier > ST.Stats.LastBestTier then
             ST.Stats.LastBestTier = entry.tier
             ST.Stats.LastBestPet  = entry.name
@@ -1432,22 +1463,19 @@ local function RunCatchCycle()
                 Notify(
                     "High-Value Catch!",
                     entry.name .. (entry.mutation and (" [" .. entry.mutation .. "]") or ""),
-                    7,
-                    "star"
+                    7, "star"
                 )
             end
         end
 
-        -- Update catch status label
-        local tierName = "Unknown"
-        for k, v in pairs(RARITY_TIERS) do if v == entry.tier then tierName = k end end
+        local tierName = TIER_NAMES[entry.tier] or "?"
         UpdateLabel(
             ST.StatusLabels.CatchStatus,
             "Confirmed: " .. ST.Stats.CatchConfirmed
             .. "  |  " .. entry.name:sub(1, 14)
             .. " [" .. tierName .. "]"
             .. (entry.mutation and " +" .. entry.mutation or "")
-            .. "  (" .. math.floor(dist) .. " st)",
+            .. "  (" .. math.floor(dist) .. "st)",
             "crosshair"
         )
     end
@@ -1470,32 +1498,36 @@ end
 
 local function BuyFood()    SafeFire(REM.BuyFood) end
 
+-- v3: FeedAllPets uses PenPets cache instead of GetDescendants in a loop.
+-- ProximityPrompt fallback still fires if FeedPet remote fails.
 local function FeedAllPets()
     local inventory = SafeInvoke(REM.getPetInventory)
-    if type(inventory) ~= "table" then return end
     local fed = 0
-    for _, petData in pairs(inventory) do
-        if type(petData) == "table"
-        and (petData.id or petData.Id or petData.petId or petData.name) then
-            local feedOk = SafeInvoke(REM.FeedPet, petData)
-            -- Fallback: FeedPrompt ProximityPrompts on pen models
-            -- (structure scan confirmed FeedPrompt [ProximityPrompt] on pen pets)
-            if feedOk == nil or feedOk == false then
-                local penFolder = Workspace:FindFirstChild("Pens")
-                             or Workspace:FindFirstChild("PlayerPens")
-                if penFolder then
-                    for _, d in ipairs(penFolder:GetDescendants()) do
-                        if d:IsA("ProximityPrompt")
-                        and d.Name:lower():find("feed") then
-                            pcall(fireproximityprompt, d)
+
+    if type(inventory) == "table" then
+        for _, petRaw in pairs(inventory) do
+            local petData = NormalizePetData(petRaw)
+            if petData then
+                local ok = SafeInvoke(REM.FeedPet, petData._raw)
+                -- Fallback: fire FeedPrompt ProximityPrompts from cached pen pets
+                if ok == nil or ok == false then
+                    for penModel in pairs(ST.PenPets) do
+                        if penModel and penModel.Parent then
+                            for _, d in ipairs(penModel:GetChildren()) do
+                                if d:IsA("ProximityPrompt")
+                                and d.Name:lower():find("feed") then
+                                    pcall(fireproximityprompt, d)
+                                end
+                            end
                         end
                     end
                 end
+                fed = fed + 1
+                task.wait(Jitter(0.09))
             end
-            fed = fed + 1
-            task.wait(Jitter(0.09))
         end
     end
+
     if fed == 0 then
         Notify("Feed", "No feedable pets found.", 3, "alert-circle")
     end
@@ -1509,8 +1541,8 @@ end
 local function ClaimIndex()
     SafeFire(REM.ClaimIndex)
     SafeFire(REM.ClaimExclusive)
-    SafeFire(REM.ClaimFeepEgg)  -- confirmed RemoteEvent (scanner-verified)
-    Notify("Rewards", "Index, exclusive, and Feep egg claimed!", 3, "star")
+    SafeFire(REM.ClaimFeepEgg)
+    Notify("Rewards", "Index, Exclusive, and Feep egg claimed!", 3, "star")
 end
 
 local function UseSpin()
@@ -1530,7 +1562,6 @@ local function RedeemCode(code)
 end
 
 local function InstantHatchAll()
-    -- GetReadyToHatchEggs returns which eggs are done (scanner-verified RemoteFunction)
     local readyEggs = SafeInvoke(REM.GetReadyToHatchEggs)
     if type(readyEggs) == "table" and #readyEggs > 0 then
         for _, egg in ipairs(readyEggs) do
@@ -1540,7 +1571,7 @@ local function InstantHatchAll()
         Notify("Eggs", "Hatched " .. #readyEggs .. " ready eggs.", 4, "egg")
         return
     end
-    -- Fallback: blind InstantHatch for all eggs
+    -- Blind fallback
     SafeFire(REM.InstantHatch)
     SafeFire(REM.InstantHatch, true)
     SafeInvoke(REM.RequestEggHatch)
@@ -1586,7 +1617,7 @@ local function SetAntiAFK(on)
 end
 
 -- ============================================================
--- S20  ESP SYSTEM
+-- S20  ESP SYSTEM (v3: RenderStepped distance updates)
 -- ============================================================
 
 local function GetESPColor(entry)
@@ -1600,8 +1631,6 @@ local function CreateESP(model)
     if ST.ESPObjects[model] then return end
     local entry = ST.PetRegistry[model]
     if not entry then return end
-
-    -- Mutation-only filter
     if CFG.ESPMutationOnly and not entry.mutation then return end
 
     local anchor = entry.anchor
@@ -1648,14 +1677,15 @@ local function CreateESP(model)
     distLabel.TextSize               = 10
     distLabel.Parent                 = bb
 
-    -- Rarity tier bar (thin colored underline)
+    -- Tier bar: thin colored underline proportional to rarity
     local tierBar = Instance.new("Frame")
-    tierBar.Size            = UDim2.new(entry.tier / 8, 0, 0, 2)
-    tierBar.Position        = UDim2.new(0, 0, 1, -2)
+    tierBar.Size             = UDim2.new(entry.tier / 8, 0, 0, 2)
+    tierBar.Position         = UDim2.new(0, 0, 1, -2)
     tierBar.BackgroundColor3 = GetESPColor(entry)
-    tierBar.BorderSizePixel = 0
-    tierBar.Parent          = bb
+    tierBar.BorderSizePixel  = 0
+    tierBar.Parent           = bb
 
+    -- AncestryChanged cleanup: no leaked BillboardGuis when pet despawns
     local ancestryConn
     ancestryConn = model.AncestryChanged:Connect(function(_, parent)
         if not parent then
@@ -1686,43 +1716,51 @@ local function DestroyAllESP()
     end
 end
 
-local function UpdateESP()
-    local root  = GetRoot()
-    local stale = {}
-
-    for model, obj in pairs(ST.ESPObjects) do
-        if model and model.Parent and obj.gui and obj.gui.Parent then
-            local entry = ST.PetRegistry[model]
-            if entry then
-                local anchor = entry.anchor
-                if root and anchor and anchor.Parent then
-                    local dist = math.floor(GetDistance(root.Position, anchor.Position))
-                    pcall(function()
-                        obj.dist.Text = dist .. " st"
-                        local color = GetESPColor(entry)
-                        if CFG.HighlightNearest and ST.NearestPet == model then
-                            obj.name.TextColor3 = Color3.fromRGB(255, 255, 80)
-                        else
-                            obj.name.TextColor3 = color
-                        end
-                    end)
+-- v3: Distance updates bound to RenderStepped so ESP runs at frame rate
+-- without adding overhead to the catch loop.
+local function StartESPRenderStep()
+    if ST.Connections.ESPRenderStep then
+        ST.Connections.ESPRenderStep:Disconnect()
+    end
+    ST.Connections.ESPRenderStep = RunService.RenderStepped:Connect(function()
+        if not CFG.ESPEnabled then return end
+        local root  = GetRoot()
+        local stale = {}
+        for model, obj in pairs(ST.ESPObjects) do
+            if model and model.Parent and obj.gui and obj.gui.Parent then
+                local entry = ST.PetRegistry[model]
+                if entry then
+                    local anchor = entry.anchor
+                    if root and anchor and anchor.Parent then
+                        local dist = math.floor(GetDistance(root.Position, anchor.Position))
+                        pcall(function()
+                            obj.dist.Text = dist .. " st"
+                            local color = GetESPColor(entry)
+                            if CFG.HighlightNearest and ST.NearestPet == model then
+                                obj.name.TextColor3 = Color3.fromRGB(255, 255, 80)
+                            else
+                                obj.name.TextColor3 = color
+                            end
+                        end)
+                    end
+                else
+                    stale[#stale + 1] = {m = model, o = obj}
                 end
             else
                 stale[#stale + 1] = {m = model, o = obj}
             end
-        else
-            stale[#stale + 1] = {m = model, o = obj}
         end
-    end
-
-    for _, e in ipairs(stale) do
-        if e.o then
-            if e.o.ancestryConn then pcall(function() e.o.ancestryConn:Disconnect() end) end
-            pcall(function() if e.o.gui then e.o.gui:Destroy() end end)
+        for _, e in ipairs(stale) do
+            if e.o then
+                if e.o.ancestryConn then pcall(function() e.o.ancestryConn:Disconnect() end) end
+                pcall(function() if e.o.gui then e.o.gui:Destroy() end end)
+            end
+            ST.ESPObjects[e.m] = nil
         end
-        ST.ESPObjects[e.m] = nil
-    end
+    end)
 end
+
+StartESPRenderStep()
 
 -- ============================================================
 -- S21  SESSION ANALYTICS
@@ -1731,7 +1769,7 @@ end
 local function CalcCatchRate()
     local elapsed = tick() - ST.Stats.SessionStart
     if elapsed < 1 then return 0 end
-    return ST.Stats.CatchConfirmed / elapsed * 3600  -- catches per hour
+    return ST.Stats.CatchConfirmed / elapsed * 3600
 end
 
 local function CalcSuccessRate()
@@ -1746,7 +1784,8 @@ end
 local function UpdateStatsDisplay()
     local sl = ST.StatusLabels
     UpdateLabel(sl.StatsRate,
-        "Catch rate: " .. string.format("%.1f", CalcCatchRate()) .. "/hr", "trending-up")
+        "Catch rate: " .. string.format("%.1f", CalcCatchRate()) .. "/hr",
+        "trending-up")
     UpdateLabel(sl.StatsSuccess,
         "Success rate: " .. CalcSuccessRate() .. "%  |  Attempts: " .. ST.Stats.CatchAttempts,
         "percent")
@@ -1759,7 +1798,6 @@ end
 -- S22  RAYFIELD GUI
 -- ============================================================
 
--- Fetch Rayfield before installing hook
 local rayfieldSrc = nil
 
 if typeof(http_request) == "function" then
@@ -1782,7 +1820,7 @@ if not rayfieldSrc then
 end
 
 if not rayfieldSrc then
-    error("[CAT] Rayfield fetch failed. Check internet connection.")
+    error("[CAT] Rayfield fetch failed. Check internet connection or CDN.")
 end
 
 local rfLoader, rfErr = loadstring(rayfieldSrc)
@@ -1794,17 +1832,13 @@ if not Rayfield then error("[CAT] Rayfield returned nil.") end
 _G.CATRayfield   = Rayfield
 ST.RayfieldReady = true
 
--- POST-LOAD: install hook now (Rayfield is in memory, hook won't intercept it)
 InstallHook()
 
--- Flush queued notifications
 for _, p in ipairs(ST.NotifyQueue) do
     pcall(function() Rayfield:Notify(p) end)
 end
 ST.NotifyQueue = {}
 
--- Build Window
--- FIX: ToggleUIKeybind must be Enum.KeyCode, not a string
 local Window = Rayfield:CreateWindow({
     Name                   = SCRIPT_NAME .. "  v" .. VERSION,
     Icon                   = "paw-print",
@@ -1817,13 +1851,14 @@ local Window = Rayfield:CreateWindow({
     ConfigurationSaving    = {
         Enabled    = true,
         FolderName = "CATScript",
-        FileName   = "CATv2Config",
+        FileName   = "CATv3Config",
     },
 })
 
--- ------------------------------------------------------------
--- TAB 1: AUTO FARM
--- ------------------------------------------------------------
+-- ============================================================
+-- GUI: TAB 1 - AUTO FARM
+-- ============================================================
+
 local FarmTab = Window:CreateTab("Auto Farm", "crosshair")
 
 FarmTab:CreateSection("Catching")
@@ -1834,6 +1869,7 @@ FarmTab:CreateToggle({
     Flag         = "AutoFarmToggle",
     Callback     = function(v)
         CFG.AutoFarm = v
+        OnConfigChange()
         Notify("Auto Farm", v and "Catching started!" or "Stopped.", 3,
                v and "play" or "square")
     end,
@@ -1846,7 +1882,7 @@ FarmTab:CreateSlider({
     Suffix       = "s",
     CurrentValue = 1.5,
     Flag         = "FarmDelaySlider",
-    Callback     = function(v) CFG.FarmDelay = v end,
+    Callback     = function(v) CFG.FarmDelay = v; OnConfigChange() end,
 })
 
 FarmTab:CreateSlider({
@@ -1856,14 +1892,14 @@ FarmTab:CreateSlider({
     Suffix       = " /min",
     CurrentValue = 30,
     Flag         = "MaxCatchPerMinSlider",
-    Callback     = function(v) CFG.MaxCatchPerMin = v end,
+    Callback     = function(v) CFG.MaxCatchPerMin = v; OnConfigChange() end,
 })
 
 FarmTab:CreateToggle({
     Name         = "Auto Place Pet After Catch",
     CurrentValue = true,
     Flag         = "AutoPlacePetToggle",
-    Callback     = function(v) CFG.AutoPlacePet = v end,
+    Callback     = function(v) CFG.AutoPlacePet = v; OnConfigChange() end,
 })
 
 FarmTab:CreateToggle({
@@ -1872,26 +1908,58 @@ FarmTab:CreateToggle({
     Flag         = "HumanModeToggle",
     Callback     = function(v)
         CFG.HumanMode = v
+        OnConfigChange()
         Notify("Human Mode", v and "Enabled -- delays randomized." or "Disabled.", 3,
                v and "user-check" or "user")
     end,
 })
 
-FarmTab:CreateSection("Priority Filter")
+FarmTab:CreateSection("Hunt Rarity Select")
+
+FarmTab:CreateParagraph({
+    Title   = "How Rarity Select works",
+    Content = "Enable specific rarities below to ONLY catch those tiers. "
+           .. "If none are enabled, the Minimum Rarity Floor applies instead. "
+           .. "Whitelist always overrides. Mutation Only stacks with this filter.",
+})
+
+-- v3: Per-rarity toggles (multi-select)
+local rarityOrder = {
+    "Secret", "Exclusive", "Mythical", "Legendary",
+    "Epic",   "Rare",      "Uncommon", "Common",
+}
+for _, rarName in ipairs(rarityOrder) do
+    local flagKey = "HuntRarity_" .. rarName
+    FarmTab:CreateToggle({
+        Name         = "Hunt " .. rarName,
+        CurrentValue = false,
+        Flag         = flagKey,
+        Callback     = function(v)
+            CFG.HuntRarities[rarName] = v
+            OnConfigChange()
+        end,
+    })
+end
+
+FarmTab:CreateSection("Minimum Rarity Floor")
+
+FarmTab:CreateParagraph({
+    Title   = "Floor mode",
+    Content = "Used only when NO rarity toggles above are enabled. "
+           .. "Catches anything AT or ABOVE this tier.",
+})
 
 FarmTab:CreateDropdown({
-    Name            = "Minimum Rarity to Catch",
-    Options         = {"All", "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythical", "Exclusive", "Secret"},
+    Name            = "Minimum Rarity (Floor)",
+    Options         = {"All", "Common", "Uncommon", "Rare", "Epic",
+                       "Legendary", "Mythical", "Exclusive", "Secret"},
     CurrentOption   = {"All"},
     MultipleOptions = false,
-    Flag            = "RarityFilterDropdown",
+    Flag            = "MinRarityDropdown",
     Callback        = function(v)
         local sel = v[1]
-        if sel == "All" then
-            CFG.RarityFilter = "Common"
-        else
-            CFG.RarityFilter = sel
-        end
+        CFG.MinRarity = (sel == "All") and 0 or (RARITY_TIERS[sel] or 0)
+        OnConfigChange()
     end,
 })
 
@@ -1899,10 +1967,10 @@ FarmTab:CreateToggle({
     Name         = "Mutation Only (catch mutated pets only)",
     CurrentValue = false,
     Flag         = "MutationOnlyToggle",
-    Callback     = function(v) CFG.MutationOnly = v end,
+    Callback     = function(v) CFG.MutationOnly = v; OnConfigChange() end,
 })
 
-FarmTab:CreateSection("Blacklist / Whitelist")
+FarmTab:CreateSection("Blacklist and Whitelist")
 
 FarmTab:CreateInput({
     Name                     = "Add to Blacklist",
@@ -1914,6 +1982,7 @@ FarmTab:CreateInput({
         if t and t ~= "" then
             table.insert(CFG.Blacklist, t)
             Notify("Blacklist", "Added: " .. t, 3, "slash")
+            OnConfigChange()
         end
     end,
 })
@@ -1928,24 +1997,19 @@ FarmTab:CreateInput({
         if t and t ~= "" then
             table.insert(CFG.Whitelist, t)
             Notify("Whitelist", "Added: " .. t, 3, "check")
+            OnConfigChange()
         end
     end,
 })
 
 FarmTab:CreateButton({
     Name     = "Clear Blacklist",
-    Callback = function()
-        CFG.Blacklist = {}
-        Notify("Blacklist", "Cleared.", 3, "trash")
-    end,
+    Callback = function() CFG.Blacklist = {}; Notify("Blacklist", "Cleared.", 3, "trash") end,
 })
 
 FarmTab:CreateButton({
     Name     = "Clear Whitelist",
-    Callback = function()
-        CFG.Whitelist = {}
-        Notify("Whitelist", "Cleared.", 3, "trash")
-    end,
+    Callback = function() CFG.Whitelist = {}; Notify("Whitelist", "Cleared.", 3, "trash") end,
 })
 
 FarmTab:CreateSection("Manual Controls")
@@ -1958,20 +2022,18 @@ FarmTab:CreateButton({
 FarmTab:CreateButton({
     Name     = "Complete Current Minigame",
     Callback = function()
-        -- Fires UpdateProgress:FireServer(100) directly.
-        -- Use this while the taming minigame is on screen to instantly
-        -- complete it without waiting for the auto-farm loop.
+        -- Fires UpdateProgress:FireServer(100) on demand.
+        -- Use while the taming minigame is on screen for an instant win.
         if REM.UpdateProgress then
             pcall(function() REM.UpdateProgress:FireServer(100) end)
             Notify("Minigame", "Progress set to 100 -- minigame complete!", 4, "check-circle")
         else
-            -- UpdateProgress not cached yet; trigger a remote refresh first
             CacheRemotes()
             if REM.UpdateProgress then
                 pcall(function() REM.UpdateProgress:FireServer(100) end)
                 Notify("Minigame", "Remote found and fired!", 4, "check-circle")
             else
-                Notify("Minigame", "UpdateProgress not found. Try re-caching.", 4, "alert-circle")
+                Notify("Minigame", "UpdateProgress not found. Try Re-cache Remotes.", 4, "alert-circle")
             end
         end
     end,
@@ -1980,9 +2042,8 @@ FarmTab:CreateButton({
 FarmTab:CreateButton({
     Name     = "Cancel Stuck Minigame",
     Callback = function()
-        -- CancelMinigame resets a stuck minigame server-side (scanner-confirmed)
         SafeFire(REM.CancelMinigame)
-        Notify("Minigame", "Cancel sent.", 3, "x-circle")
+        Notify("Minigame", "CancelMinigame sent.", 3, "x-circle")
     end,
 })
 
@@ -2003,12 +2064,9 @@ FarmTab:CreateSection("Tame All Pets")
 
 FarmTab:CreateParagraph({
     Title   = "How Tame All works",
-    Content = "Fires ThrowLasso + UpdateProgress(100) at every pet in the"
-           .. " registry simultaneously. No teleporting required -- the"
-           .. " server receives the lasso fire with the pets position."
-           .. " UpdateProgress:FireServer(100) is the confirmed instant-catch"
-           .. " remote used by all public scripts."
-           .. " Respects your rarity filter, blacklist, and whitelist.",
+    Content = "Fires ThrowLasso + UpdateProgress(100) at every registered pet. "
+           .. "v3 uses a worker pool (max 8 concurrent goroutines) so the remote "
+           .. "fire rate stays controlled. Respects rarity select, blacklist, whitelist.",
 })
 
 FarmTab:CreateToggle({
@@ -2017,6 +2075,7 @@ FarmTab:CreateToggle({
     Flag         = "TameAllToggle",
     Callback     = function(v)
         CFG.TameAll = v
+        OnConfigChange()
         Notify("Tame All", v and "Looping tame-all active!" or "Stopped.", 4,
                v and "zap" or "square")
     end,
@@ -2029,7 +2088,7 @@ FarmTab:CreateSlider({
     Suffix       = "s",
     CurrentValue = 5,
     Flag         = "TameAllDelaySlider",
-    Callback     = function(v) CFG.TameAllDelay = v end,
+    Callback     = function(v) CFG.TameAllDelay = v; OnConfigChange() end,
 })
 
 FarmTab:CreateSlider({
@@ -2039,7 +2098,7 @@ FarmTab:CreateSlider({
     Suffix       = "s",
     CurrentValue = 0.08,
     Flag         = "TameAllStaggerSlider",
-    Callback     = function(v) CFG.TameAllStagger = v end,
+    Callback     = function(v) CFG.TameAllStagger = v; OnConfigChange() end,
 })
 
 FarmTab:CreateButton({
@@ -2057,15 +2116,16 @@ FarmTab:CreateButton({
 
 FarmTab:CreateSection("Live Status")
 
-local CatchStatusLabel = FarmTab:CreateLabel("Confirmed catches: 0", "activity")
+local CatchStatusLabel  = FarmTab:CreateLabel("Confirmed catches: 0", "activity")
 ST.StatusLabels.CatchStatus = CatchStatusLabel
 
 local TameAllStatusLabel = FarmTab:CreateLabel("Tame All: not run yet", "zap")
 ST.StatusLabels.TameAllStatus = TameAllStatusLabel
 
--- ------------------------------------------------------------
--- TAB 2: ECONOMY
--- ------------------------------------------------------------
+-- ============================================================
+-- GUI: TAB 2 - ECONOMY
+-- ============================================================
+
 local EconTab = Window:CreateTab("Economy", "coins")
 
 EconTab:CreateSection("Cash")
@@ -2076,6 +2136,7 @@ EconTab:CreateToggle({
     Flag         = "AutoCollectToggle",
     Callback     = function(v)
         CFG.AutoCollect = v
+        OnConfigChange()
         if v then task.spawn(CollectAllCash) end
         Notify("Cash", v and "Auto-collect active!" or "Stopped.", 3,
                v and "trending-up" or "pause")
@@ -2089,12 +2150,15 @@ EconTab:CreateSlider({
     Suffix       = "s",
     CurrentValue = 30,
     Flag         = "CollectIntervalSlider",
-    Callback     = function(v) CFG.CollectInterval = v end,
+    Callback     = function(v) CFG.CollectInterval = v; OnConfigChange() end,
 })
 
 EconTab:CreateButton({
     Name     = "Collect Now",
-    Callback = function() task.spawn(CollectAllCash); Notify("Cash", "Collected!", 3, "dollar-sign") end,
+    Callback = function()
+        task.spawn(CollectAllCash)
+        Notify("Cash", "Collected!", 3, "dollar-sign")
+    end,
 })
 
 local CashStatusLabel = EconTab:CreateLabel("Last collect: not yet", "clock")
@@ -2106,14 +2170,14 @@ EconTab:CreateToggle({
     Name         = "Auto Buy Food",
     CurrentValue = false,
     Flag         = "AutoBuyFoodToggle",
-    Callback     = function(v) CFG.AutoBuyFood = v end,
+    Callback     = function(v) CFG.AutoBuyFood = v; OnConfigChange() end,
 })
 
 EconTab:CreateToggle({
     Name         = "Auto Feed All Pets",
     CurrentValue = false,
     Flag         = "AutoFeedToggle",
-    Callback     = function(v) CFG.AutoFeedPets = v end,
+    Callback     = function(v) CFG.AutoFeedPets = v; OnConfigChange() end,
 })
 
 EconTab:CreateSlider({
@@ -2123,7 +2187,7 @@ EconTab:CreateSlider({
     Suffix       = "s",
     CurrentValue = 60,
     Flag         = "FeedIntervalSlider",
-    Callback     = function(v) CFG.FeedInterval = v end,
+    Callback     = function(v) CFG.FeedInterval = v; OnConfigChange() end,
 })
 
 EconTab:CreateButton({
@@ -2144,6 +2208,7 @@ EconTab:CreateToggle({
     Flag         = "AutoSellPetsToggle",
     Callback     = function(v)
         CFG.AutoSellPets = v
+        OnConfigChange()
         Notify("Sell", v and "Auto-sell pets active." or "Stopped.", 3,
                v and "trash" or "pause")
     end,
@@ -2155,14 +2220,14 @@ EconTab:CreateDropdown({
     CurrentOption   = {"Uncommon"},
     MultipleOptions = false,
     Flag            = "SellBelowRarityDropdown",
-    Callback        = function(v) CFG.SellBelowRarity = v[1] end,
+    Callback        = function(v) CFG.SellBelowRarity = v[1]; OnConfigChange() end,
 })
 
 EconTab:CreateToggle({
     Name         = "Auto Sell Eggs",
     CurrentValue = false,
     Flag         = "AutoSellEggsToggle",
-    Callback     = function(v) CFG.AutoSellEggs = v end,
+    Callback     = function(v) CFG.AutoSellEggs = v; OnConfigChange() end,
 })
 
 EconTab:CreateButton({
@@ -2181,30 +2246,39 @@ EconTab:CreateToggle({
     Name         = "Auto Claim Login Reward",
     CurrentValue = false,
     Flag         = "AutoLoginToggle",
-    Callback     = function(v) CFG.AutoClaimLogin = v; if v then ClaimLogin() end end,
+    Callback     = function(v)
+        CFG.AutoClaimLogin = v
+        OnConfigChange()
+        if v then ClaimLogin() end
+    end,
 })
 
 EconTab:CreateToggle({
     Name         = "Auto Claim Index Rewards",
     CurrentValue = false,
     Flag         = "AutoIndexToggle",
-    Callback     = function(v) CFG.AutoClaimIndex = v; if v then ClaimIndex() end end,
+    Callback     = function(v)
+        CFG.AutoClaimIndex = v
+        OnConfigChange()
+        if v then ClaimIndex() end
+    end,
 })
 
 EconTab:CreateToggle({
     Name         = "Auto Use Spins",
     CurrentValue = false,
     Flag         = "AutoSpinToggle",
-    Callback     = function(v) CFG.AutoSpin = v end,
+    Callback     = function(v) CFG.AutoSpin = v; OnConfigChange() end,
 })
 
-EconTab:CreateButton({ Name = "Claim Login Reward", Callback = ClaimLogin })
+EconTab:CreateButton({ Name = "Claim Login Reward",  Callback = ClaimLogin })
 EconTab:CreateButton({ Name = "Claim Index Rewards", Callback = ClaimIndex })
 EconTab:CreateButton({ Name = "Use Spin",            Callback = UseSpin    })
 
--- ------------------------------------------------------------
--- TAB 3: EGGS AND BREEDING
--- ------------------------------------------------------------
+-- ============================================================
+-- GUI: TAB 3 - EGGS AND BREEDING
+-- ============================================================
+
 local EggTab = Window:CreateTab("Eggs & Breeding", "star")
 
 EggTab:CreateSection("Hatching")
@@ -2215,6 +2289,7 @@ EggTab:CreateToggle({
     Flag         = "AutoHatchToggle",
     Callback     = function(v)
         CFG.AutoHatch = v
+        OnConfigChange()
         Notify("Eggs", v and "Auto hatch enabled!" or "Stopped.", 3, v and "zap" or "pause")
     end,
 })
@@ -2226,7 +2301,7 @@ EggTab:CreateSlider({
     Suffix       = "s",
     CurrentValue = 10,
     Flag         = "HatchIntervalSlider",
-    Callback     = function(v) CFG.HatchInterval = v end,
+    Callback     = function(v) CFG.HatchInterval = v; OnConfigChange() end,
 })
 
 EggTab:CreateButton({
@@ -2236,24 +2311,62 @@ EggTab:CreateButton({
 
 EggTab:CreateSection("Breeding")
 
+EggTab:CreateParagraph({
+    Title   = "Breed Modes",
+    Content = "Recipe Auto Breed: scans inventory for known recipe pairs "
+           .. "(e.g. Griffin + Griffin) and breeds them first. "
+           .. "Smart Breed: pairs pets with the same name (doubles). "
+           .. "Rarity Match: pairs same-tier pets. "
+           .. "One mode is active at a time (Recipe > Smart > Rarity > Blind).",
+})
+
 EggTab:CreateToggle({
     Name         = "Auto Breed",
     CurrentValue = false,
     Flag         = "AutoBreedToggle",
     Callback     = function(v)
         CFG.AutoBreed = v
+        OnConfigChange()
         Notify("Breeding", v and "Auto breed started!" or "Stopped.", 3,
                v and "git-merge" or "pause")
     end,
 })
 
 EggTab:CreateToggle({
-    Name         = "Smart Breed (pair same-rarity pets)",
+    Name         = "Recipe Auto Breed (known pairs)",
+    CurrentValue = false,
+    Flag         = "RecipeBreedToggle",
+    Callback     = function(v)
+        CFG.RecipeBreed = v
+        if v then
+            CFG.SmartBreed = false
+            CFG.BreedRarityMatch = false
+        end
+        OnConfigChange()
+        Notify("Breed", v and "Recipe mode active." or "Disabled.", 3, "book")
+    end,
+})
+
+EggTab:CreateToggle({
+    Name         = "Smart Breed (pair doubles)",
     CurrentValue = false,
     Flag         = "SmartBreedToggle",
     Callback     = function(v)
         CFG.SmartBreed = v
+        if v then CFG.RecipeBreed = false end
+        CFG.BreedRarityMatch = false
+        OnConfigChange()
+    end,
+})
+
+EggTab:CreateToggle({
+    Name         = "Rarity Match Breed (same-tier pairing)",
+    CurrentValue = false,
+    Flag         = "RarityMatchBreedToggle",
+    Callback     = function(v)
         CFG.BreedRarityMatch = v
+        if v then CFG.RecipeBreed = false end
+        OnConfigChange()
     end,
 })
 
@@ -2264,7 +2377,7 @@ EggTab:CreateSlider({
     Suffix       = "s",
     CurrentValue = 5,
     Flag         = "BreedDelaySlider",
-    Callback     = function(v) CFG.BreedDelay = v end,
+    Callback     = function(v) CFG.BreedDelay = v; OnConfigChange() end,
 })
 
 EggTab:CreateButton({
@@ -2275,17 +2388,17 @@ EggTab:CreateButton({
     end,
 })
 
--- ------------------------------------------------------------
--- TAB 4: EVENTS AND WEATHER
--- ------------------------------------------------------------
+-- ============================================================
+-- GUI: TAB 4 - EVENTS AND WEATHER
+-- ============================================================
+
 local EventsTab = Window:CreateTab("Events", "cloud-lightning")
 
 EventsTab:CreateSection("Weather Monitor")
 
-local WeatherLabel = EventsTab:CreateLabel("Weather: Detecting...", "cloud")
-ST.StatusLabels.Weather = WeatherLabel
-
+local WeatherLabel    = EventsTab:CreateLabel("Weather: Detecting...", "cloud")
 local WeatherPetsLabel = EventsTab:CreateLabel("Active spawns: --", "paw-print")
+ST.StatusLabels.Weather     = WeatherLabel
 ST.StatusLabels.WeatherPets = WeatherPetsLabel
 
 EventsTab:CreateToggle({
@@ -2294,6 +2407,7 @@ EventsTab:CreateToggle({
     Flag         = "AutoTotemToggle",
     Callback     = function(v)
         CFG.AutoTotem = v
+        OnConfigChange()
         Notify("Totem", v and "Auto-totem active." or "Stopped.", 3, "cloud-lightning")
     end,
 })
@@ -2305,17 +2419,22 @@ EventsTab:CreateDropdown({
     CurrentOption   = {"Thunderstorm"},
     MultipleOptions = false,
     Flag            = "TargetWeatherDropdown",
-    Callback        = function(v) CFG.TargetWeather = v[1] end,
+    Callback        = function(v) CFG.TargetWeather = v[1]; OnConfigChange() end,
 })
 
 EventsTab:CreateButton({
     Name     = "Use Weather Totem Now",
-    Callback = function()
-        UseWeatherTotem()
-    end,
+    Callback = function() UseWeatherTotem() end,
 })
 
 EventsTab:CreateSection("Fruit Collection")
+
+EventsTab:CreateParagraph({
+    Title   = "Hold Bypass",
+    Content = "v3: Sets ProximityPrompt.HoldDuration = 0 on the client "
+           .. "before firing, bypassing the server hold timer. "
+           .. "Toggle off if it causes issues with future game patches.",
+})
 
 EventsTab:CreateToggle({
     Name         = "Auto Collect Fruits",
@@ -2323,9 +2442,17 @@ EventsTab:CreateToggle({
     Flag         = "AutoFruitToggle",
     Callback     = function(v)
         CFG.AutoFruitCollect = v
+        OnConfigChange()
         Notify("Fruits", v and "Auto-collect fruits active." or "Stopped.", 3,
                v and "sun" or "pause")
     end,
+})
+
+EventsTab:CreateToggle({
+    Name         = "Fruit Hold-Timer Bypass",
+    CurrentValue = true,
+    Flag         = "FruitHoldBypassToggle",
+    Callback     = function(v) CFG.FruitHoldBypass = v; OnConfigChange() end,
 })
 
 EventsTab:CreateDropdown({
@@ -2336,11 +2463,8 @@ EventsTab:CreateDropdown({
     Flag            = "FruitTypeDropdown",
     Callback        = function(v)
         local sel = v[1]
-        if sel == "Both" then
-            CFG.FruitTypes = {"Volcanic", "Cosmic"}
-        else
-            CFG.FruitTypes = {sel}
-        end
+        CFG.FruitTypes = (sel == "Both") and {"Volcanic", "Cosmic"} or {sel}
+        OnConfigChange()
     end,
 })
 
@@ -2358,12 +2482,13 @@ EventsTab:CreateToggle({
     Name         = "Skeleton Event Alert",
     CurrentValue = false,
     Flag         = "SkeletonAlertToggle",
-    Callback     = function(v) CFG.SkeletonAlert = v end,
+    Callback     = function(v) CFG.SkeletonAlert = v; OnConfigChange() end,
 })
 
--- ------------------------------------------------------------
--- TAB 5: PET ESP
--- ------------------------------------------------------------
+-- ============================================================
+-- GUI: TAB 5 - PET ESP
+-- ============================================================
+
 local ESPTab = Window:CreateTab("Pet ESP", "eye")
 
 ESPTab:CreateSection("Overlay Settings")
@@ -2374,6 +2499,7 @@ ESPTab:CreateToggle({
     Flag         = "ESPToggle",
     Callback     = function(v)
         CFG.ESPEnabled = v
+        OnConfigChange()
         if v then
             for model in pairs(ST.PetRegistry) do CreateESP(model) end
             local n = 0
@@ -2390,7 +2516,7 @@ ESPTab:CreateToggle({
     Name         = "Rarity Color Coding",
     CurrentValue = true,
     Flag         = "ESPRarityColorsToggle",
-    Callback     = function(v) CFG.ESPRarityColors = v end,
+    Callback     = function(v) CFG.ESPRarityColors = v; OnConfigChange() end,
 })
 
 ESPTab:CreateColorPicker({
@@ -2399,8 +2525,9 @@ ESPTab:CreateColorPicker({
     Flag     = "ESPColorPicker",
     Callback = function(v)
         CFG.ESPColor = v
-        for _, obj in pairs(ST.ESPObjects) do
-            if not CFG.ESPRarityColors then
+        OnConfigChange()
+        if not CFG.ESPRarityColors then
+            for _, obj in pairs(ST.ESPObjects) do
                 pcall(function() obj.name.TextColor3 = v end)
             end
         end
@@ -2413,10 +2540,9 @@ ESPTab:CreateToggle({
     Flag         = "ShowMutationBadgeToggle",
     Callback     = function(v)
         CFG.ShowMutationBadge = v
+        OnConfigChange()
         for _, obj in pairs(ST.ESPObjects) do
-            pcall(function()
-                obj.mut.Visible = v
-            end)
+            pcall(function() obj.mut.Visible = v end)
         end
     end,
 })
@@ -2427,6 +2553,7 @@ ESPTab:CreateToggle({
     Flag         = "ESPMutationOnlyToggle",
     Callback     = function(v)
         CFG.ESPMutationOnly = v
+        OnConfigChange()
         DestroyAllESP()
         if CFG.ESPEnabled then
             for model in pairs(ST.PetRegistry) do CreateESP(model) end
@@ -2438,7 +2565,7 @@ ESPTab:CreateToggle({
     Name         = "Gold Highlight on Best Target",
     CurrentValue = false,
     Flag         = "HighlightNearestToggle",
-    Callback     = function(v) CFG.HighlightNearest = v end,
+    Callback     = function(v) CFG.HighlightNearest = v; OnConfigChange() end,
 })
 
 ESPTab:CreateSection("Registry")
@@ -2463,9 +2590,10 @@ ESPTab:CreateButton({
     end,
 })
 
--- ------------------------------------------------------------
--- TAB 6: UTILITY
--- ------------------------------------------------------------
+-- ============================================================
+-- GUI: TAB 6 - UTILITY
+-- ============================================================
+
 local UtilTab = Window:CreateTab("Utility", "wrench")
 
 UtilTab:CreateSection("Movement")
@@ -2477,7 +2605,7 @@ UtilTab:CreateSlider({
     Suffix       = " WS",
     CurrentValue = 16,
     Flag         = "WalkSpeedSlider",
-    Callback     = function(v) CFG.WalkSpeed = v; ApplyMovement() end,
+    Callback     = function(v) CFG.WalkSpeed = v; ApplyMovement(); OnConfigChange() end,
 })
 
 UtilTab:CreateSlider({
@@ -2487,14 +2615,14 @@ UtilTab:CreateSlider({
     Suffix       = " JP",
     CurrentValue = 50,
     Flag         = "JumpPowerSlider",
-    Callback     = function(v) CFG.JumpPower = v; ApplyMovement() end,
+    Callback     = function(v) CFG.JumpPower = v; ApplyMovement(); OnConfigChange() end,
 })
 
 UtilTab:CreateToggle({
     Name         = "Infinite Jump",
     CurrentValue = false,
     Flag         = "InfiniteJumpToggle",
-    Callback     = function(v) CFG.InfiniteJump = v; SetInfiniteJump(v) end,
+    Callback     = function(v) CFG.InfiniteJump = v; SetInfiniteJump(v); OnConfigChange() end,
 })
 
 UtilTab:CreateToggle({
@@ -2504,6 +2632,7 @@ UtilTab:CreateToggle({
     Callback     = function(v)
         CFG.AntiAFK = v
         SetAntiAFK(v)
+        OnConfigChange()
         Notify("Anti-AFK", v and "Enabled." or "Disabled.", 3,
                v and "shield" or "shield-off")
     end,
@@ -2525,7 +2654,6 @@ UtilTab:CreateInput({
 UtilTab:CreateButton({
     Name     = "Upgrade Farm / Extend Fence",
     Callback = function()
-        -- extendFence is the confirmed fence-upgrade remote (RemoteFunction)
         SafeInvoke(REM.extendFence)
         SafeFire(REM.AttemptUpgradeFarm)
         Notify("Farm", "Fence extend + farm upgrade sent.", 3, "arrow-up-circle")
@@ -2568,9 +2696,10 @@ UtilTab:CreateButton({
     end,
 })
 
--- ------------------------------------------------------------
--- TAB 7: SESSION STATS
--- ------------------------------------------------------------
+-- ============================================================
+-- GUI: TAB 7 - STATS
+-- ============================================================
+
 local StatsTab = Window:CreateTab("Stats", "bar-chart")
 
 StatsTab:CreateSection("Session Analytics")
@@ -2578,15 +2707,17 @@ StatsTab:CreateSection("Session Analytics")
 local StatsRateLabel    = StatsTab:CreateLabel("Catch rate: --", "trending-up")
 local StatsSuccessLabel = StatsTab:CreateLabel("Success rate: --", "percent")
 local StatsSessionLabel = StatsTab:CreateLabel("Session: 00:00  |  Best: None", "clock")
-
 ST.StatusLabels.StatsRate    = StatsRateLabel
 ST.StatusLabels.StatsSuccess = StatsSuccessLabel
 ST.StatusLabels.StatsSession = StatsSessionLabel
 
-StatsTab:CreateSection("Signature Map")
+StatsTab:CreateSection("Remote Debug")
 
 local SigCountLabel = StatsTab:CreateLabel("Captured remote sigs: 0", "radio")
 ST.StatusLabels.SigCount = SigCountLabel
+
+local RemCacheLabel = StatsTab:CreateLabel("Remotes cached: 0", "server")
+ST.StatusLabels.RemCache = RemCacheLabel
 
 StatsTab:CreateButton({
     Name     = "Print Captured Signatures",
@@ -2606,6 +2737,29 @@ StatsTab:CreateButton({
 })
 
 StatsTab:CreateButton({
+    Name     = "Print Remote Call Log",
+    Callback = function()
+        -- v3: Print last 50 remote calls from ring buffer
+        local count = 0
+        for i = 1, ST.RemoteLogMax do
+            local entry = ST.RemoteLog[i]
+            if entry then
+                count = count + 1
+                local argStr = ""
+                for j, a in ipairs(entry.args or {}) do
+                    argStr = argStr .. tostring(a)
+                    if j < #entry.args then argStr = argStr .. ", " end
+                end
+                print(string.format("[CAT-LOG] +%.1fs %s:%s(%s)",
+                    entry.time - ST.Stats.SessionStart,
+                    entry.name, entry.method, argStr))
+            end
+        end
+        Notify("Log", count .. " remote calls in buffer.", 4, "list")
+    end,
+})
+
+StatsTab:CreateButton({
     Name     = "Reset Session Stats",
     Callback = function()
         ST.Stats.CatchAttempts  = 0
@@ -2617,9 +2771,10 @@ StatsTab:CreateButton({
     end,
 })
 
--- ------------------------------------------------------------
--- TAB 8: SETTINGS
--- ------------------------------------------------------------
+-- ============================================================
+-- GUI: TAB 8 - SETTINGS
+-- ============================================================
+
 local SettingsTab = Window:CreateTab("Settings", "settings")
 
 SettingsTab:CreateSection("Appearance")
@@ -2638,7 +2793,6 @@ SettingsTab:CreateDropdown({
 
 SettingsTab:CreateSection("Keybinds")
 
--- NOTE: CreateKeybind CurrentKeybind accepts a string (different from ToggleUIKeybind)
 SettingsTab:CreateKeybind({
     Name           = "Toggle GUI",
     CurrentKeybind = "RightShift",
@@ -2652,8 +2806,8 @@ SettingsTab:CreateSection("Script Info")
 do
     local remCount = 0
     local petCount = 0
-    for _ in pairs(REM) do remCount = remCount + 1 end
-    for _ in pairs(ST.PetRegistry) do petCount = petCount + 1 end
+    for _ in pairs(REM)            do remCount  = remCount  + 1 end
+    for _ in pairs(ST.PetRegistry) do petCount  = petCount  + 1 end
 
     SettingsTab:CreateParagraph({
         Title   = SCRIPT_NAME .. " v" .. VERSION,
@@ -2661,23 +2815,26 @@ do
                .. "\nRemotes cached: " .. remCount
                .. "\nPets in registry: " .. petCount
                .. "\nHook active: " .. tostring(ST.HookActive)
-               .. "\n\nTabs: Auto Farm / Economy / Eggs / Events / ESP / Utility / Stats"
-               .. "\n\nTip: Play one catch manually to train the minigame"
-               .. "\nsignature validator before enabling Auto Farm.",
+               .. "\nPool max: " .. TAME_POOL_MAX .. " concurrent threads"
+               .. "\n\nv3 new: Multi-rarity hunt select, Recipe Auto Breed,"
+               .. " Fruit hold bypass, Worker pool TameAll,"
+               .. " RenderStepped ESP, Debounced config save."
+               .. "\n\nTip: Play one catch manually to train the"
+               .. " minigame signature before enabling Auto Farm.",
     })
 end
 
 -- ============================================================
--- S23  MAIN CONSOLIDATED LOOP
+-- S23  MAIN CONSOLIDATED LOOP (10 Hz - all background features)
 -- ============================================================
 
 task.spawn(function()
     local timers = {
-        collect   = 0, feed    = 0, breed  = 0,
-        hatch     = 0, spin    = 0, esp    = 0,
-        petcount  = 0, stats   = 0, move   = 0,
-        weather   = 0, sell    = 0, fruits = 0,
-        skeleton  = 0,
+        collect  = 0, feed     = 0, breed   = 0,
+        hatch    = 0, spin     = 0,
+        petcount = 0, stats    = 0, move    = 0,
+        weather  = 0, sell     = 0, fruits  = 0,
+        skeleton = 0, remcache = 0,
     }
 
     while ST.Running
@@ -2685,19 +2842,21 @@ task.spawn(function()
          and getgenv().CAT_SESSION == SESSION_TOKEN)) do
         local now = tick()
 
-        -- Movement enforcement
+        -- Movement enforcement (re-applies WalkSpeed/JumpPower every second)
         if now - timers.move > 1 then
-            if CFG.WalkSpeed ~= 16 or CFG.JumpPower ~= 50 then ApplyMovement() end
+            if CFG.WalkSpeed ~= 16 or CFG.JumpPower ~= 50 then
+                ApplyMovement()
+            end
             timers.move = now
         end
 
-        -- Auto collect
+        -- Auto collect cash
         if CFG.AutoCollect and now - timers.collect > CFG.CollectInterval then
             task.spawn(CollectAllCash)
             timers.collect = now
         end
 
-        -- Feed / food
+        -- Auto buy food + feed
         if now - timers.feed > CFG.FeedInterval then
             if CFG.AutoBuyFood  then task.spawn(BuyFood) end
             if CFG.AutoFeedPets then task.spawn(FeedAllPets) end
@@ -2722,30 +2881,30 @@ task.spawn(function()
             timers.spin = now
         end
 
-        -- ESP update
-        if CFG.ESPEnabled and now - timers.esp > 0.5 then
-            UpdateESP()
-            timers.esp = now
-        end
-
-        -- Pet count label
+        -- Pet count label update
         if now - timers.petcount > 2.5 then
             local n = 0
             for _ in pairs(ST.PetRegistry) do n = n + 1 end
-            UpdateLabel(ST.StatusLabels.PetCount, "Roaming pets in registry: " .. n, "map-pin")
+            UpdateLabel(ST.StatusLabels.PetCount,
+                "Roaming pets in registry: " .. n, "map-pin")
             timers.petcount = now
         end
 
-        -- Session stats
+        -- Session stats display
         if now - timers.stats > 3 then
             UpdateStatsDisplay()
             local sigCount = 0
             for _ in pairs(ST.RemoteSigs) do sigCount = sigCount + 1 end
-            UpdateLabel(ST.StatusLabels.SigCount, "Captured remote sigs: " .. sigCount, "radio")
+            UpdateLabel(ST.StatusLabels.SigCount,
+                "Captured remote sigs: " .. sigCount, "radio")
+            local remCount = 0
+            for _ in pairs(REM) do remCount = remCount + 1 end
+            UpdateLabel(ST.StatusLabels.RemCache,
+                "Remotes cached: " .. remCount, "server")
             timers.stats = now
         end
 
-        -- Weather detection
+        -- Weather detection + totem
         if now - timers.weather > 10 then
             task.spawn(function()
                 DetectWeather()
@@ -2757,8 +2916,8 @@ task.spawn(function()
                     "Weather: " .. ST.Weather.Current, "cloud")
                 UpdateLabel(ST.StatusLabels.WeatherPets,
                     "Active spawns: " .. wpStr, "paw-print")
-
-                if CFG.AutoTotem and ST.Weather.Current ~= CFG.TargetWeather then
+                if CFG.AutoTotem
+                and ST.Weather.Current ~= CFG.TargetWeather then
                     UseWeatherTotem()
                 end
             end)
@@ -2780,25 +2939,37 @@ task.spawn(function()
 
         -- Skeleton event countdown
         if now - timers.skeleton > 5 then
-            local sinceLastSeen = now - (ST.Skeleton.LastSeen > 0 and ST.Skeleton.LastSeen or now)
-            local timeToNext = SKELETON_INTERVAL - (sinceLastSeen % SKELETON_INTERVAL)
+            local sinceLastSeen = now - (ST.Skeleton.LastSeen > 0
+                and ST.Skeleton.LastSeen or now)
+            local timeToNext = SKELETON_INTERVAL
+                - (sinceLastSeen % SKELETON_INTERVAL)
             UpdateLabel(ST.StatusLabels.Skeleton,
-                "Skeleton event: ~" .. FormatTime(timeToNext) .. " to next", "skull")
-
-            if CFG.SkeletonAlert and timeToNext < 120 and timeToNext > 90 then
-                Notify("Skeleton Event", "Starting in ~" .. math.floor(timeToNext) .. "s!", 8, "alert-triangle")
+                "Skeleton event: ~" .. FormatTime(timeToNext) .. " to next",
+                "skull")
+            if CFG.SkeletonAlert
+            and timeToNext < 120 and timeToNext > 90 then
+                Notify("Skeleton Event",
+                    "Starting in ~" .. math.floor(timeToNext) .. "s!",
+                    8, "alert-triangle")
             end
             timers.skeleton = now
         end
 
-        task.wait(0.1)
+        -- Periodic remote re-cache (every 30s, catches late-joining remotes)
+        if now - timers.remcache > 30 then
+            CacheRemotes()
+            timers.remcache = now
+        end
+
+        task.wait(0.1)  -- 10 Hz background loop
     end
 end)
 
 -- ============================================================
--- S24  AUTO FARM LOOP
+-- S24  AUTO FARM LOOP + TAME ALL LOOP
 -- ============================================================
 
+-- Auto Farm: single-target best-pet catch cycle
 task.spawn(function()
     while ST.Running
     and (not getgenv or (getgenv().CAT_RUNNING ~= false
@@ -2812,7 +2983,7 @@ task.spawn(function()
     end
 end)
 
--- Tame All loop runs on its own thread, separate from single-catch farm
+-- Tame All: mass tame loop (worker pool bounded, separate thread)
 task.spawn(function()
     local tameTimer = 0
     while ST.Running
@@ -2834,8 +3005,8 @@ end)
 ST.Connections.CharacterAdded = Player.CharacterAdded:Connect(function()
     task.wait(1.5)
     ApplyMovement()
-    if CFG.InfiniteJump  then SetInfiniteJump(true) end
-    if CFG.AntiAFK       then SetAntiAFK(true) end
+    if CFG.InfiniteJump then SetInfiniteJump(true) end
+    if CFG.AntiAFK      then SetAntiAFK(true) end
     task.wait(0.5)
     SafeFire(REM.ClientReady)
     Notify("Character", "Respawned. Systems restored.", 3, "user")
@@ -2848,12 +3019,13 @@ end)
 do
     task.wait(0.5)
     SafeFire(REM.ClientReady)
-    Rayfield:LoadConfiguration()
+
+    pcall(function() Rayfield:LoadConfiguration() end)
 
     -- Restore Xeno persisted config
     if IS_XENO and Xeno and Xeno.GetGlobal then
         pcall(function()
-            local saved = Xeno.GetGlobal("CATConfig_v200")
+            local saved = Xeno.GetGlobal("CATConfig_v300")
             if type(saved) == "table" then
                 for k, v in pairs(saved) do
                     if CFG[k] ~= nil and type(CFG[k]) == type(v) then
@@ -2864,37 +3036,39 @@ do
         end)
     end
 
-    -- Initial weather detection
+    -- Initial weather probe
     task.defer(DetectWeather)
 
     local remCount, petCount = 0, 0
-    for _ in pairs(REM)           do remCount  = remCount  + 1 end
+    for _ in pairs(REM)            do remCount = remCount + 1 end
     for _ in pairs(ST.PetRegistry) do petCount = petCount + 1 end
 
     Notify(
         SCRIPT_NAME .. " v" .. VERSION,
         remCount .. " remotes  |  " .. petCount .. " pets found\n"
         .. "RightShift to toggle GUI\n"
-        .. "Play one catch to train signature.",
-        8,
-        "paw-print"
+        .. "v3: Multi-rarity select, Recipe Breed, Hold Bypass",
+        9, "paw-print"
     )
-    print(string.format("[CAT] v%s init: %d remotes, %d pets, hook=%s",
-        VERSION, remCount, petCount, tostring(ST.HookActive)))
+    print(string.format(
+        "[CAT] v%s init: %d remotes, %d pets, hook=%s, executor=%s",
+        VERSION, remCount, petCount,
+        tostring(ST.HookActive), EXECUTOR_NAME
+    ))
 end
 
--- Xeno config auto-save every 30s
+-- Xeno config auto-save loop (belt + suspenders alongside debounced on-change)
 if IS_XENO and Xeno and Xeno.SetGlobal then
     task.spawn(function()
         while ST.Running
         and (not getgenv or (getgenv().CAT_RUNNING ~= false
              and getgenv().CAT_SESSION == SESSION_TOKEN)) do
             task.wait(30)
-            pcall(function() Xeno.SetGlobal("CATConfig_v200", CFG) end)
+            pcall(function() Xeno.SetGlobal("CATConfig_v300", CFG) end)
         end
     end)
 end
 
 -- ============================================================
--- END OF SCRIPT  v2.0.0
+-- END OF SCRIPT  v3.0.0
 -- ============================================================
